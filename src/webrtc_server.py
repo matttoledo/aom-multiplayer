@@ -34,6 +34,7 @@ import av
 import aiortc.codecs
 import aiortc.rtcrtpsender
 from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.rtcconfiguration import RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import MediaStreamTrack
 from aiortc.rtcicetransport import RTCIceCandidate
@@ -66,6 +67,29 @@ BITRATE = int(os.environ.get("BITRATE", "17000000"))
 MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "20000000"))
 PRESET = os.environ.get("PRESET", "p4")
 PORT = int(os.environ.get("PORT", "8081"))
+
+# TURN: o tunel Cloudflare leva apenas a signalizacao (HTTP/WS), nunca midia. Sem
+# TURN o caminho WebRTC funciona so para cliente que alcanca o asus diretamente
+# (mesma LAN ou malha). Medido no asus: STUN UDP e TCP para Google e Cloudflare
+# todos com timeout, e TCP 3478 tambem - o egress permite TCP 80/443 e nada mais.
+# aioice (backend do aiortc) suporta STUN/TURN, entao basta um TURN alcancavel.
+TURN_URL = os.environ.get("TURN_URL", "")
+TURN_USER = os.environ.get("TURN_USER", "")
+TURN_PASS = os.environ.get("TURN_PASS", "")
+
+
+def ice_servers():
+    if not TURN_URL:
+        return []
+    return [RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS)]
+
+
+def ice_for_client():
+    # o navegador precisa dos mesmos servidores; o cliente cria o
+    # RTCPeerConnection antes do answer, entao isso vai no hello-ok
+    if not TURN_URL:
+        return []
+    return [{"urls": [TURN_URL], "username": TURN_USER, "credential": TURN_PASS}]
 WINDOW_NAME = os.environ.get("WINDOW_NAME", "Age of Mythology").lower()
 
 # ATENCAO: no FFmpeg 7 (PyAV 17) as AVOptions do h264_nvenc NAO incluem
@@ -315,7 +339,7 @@ async def handler(ws):
         except Exception:
             pass
 
-    pc = RTCPeerConnection()
+    pc = RTCPeerConnection(ice_servers())
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
 
@@ -331,7 +355,7 @@ async def handler(ws):
     def on_state():
         print("estado:", pc.connectionState, flush=True)
 
-    await ws.send(json.dumps({"t": "hello-ok", "mode": "webrtc"}))
+    await ws.send(json.dumps({"t": "hello-ok", "mode": "webrtc", "ice": ice_for_client()}))
 
     try:
         async for raw in ws:

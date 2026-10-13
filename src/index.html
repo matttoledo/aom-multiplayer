@@ -43,6 +43,7 @@ let asb = null;              // SourceBuffer de audio (AAC). Audio sempre vai po
 let audioQueue = [];
 let audioCodec = 'mp4a.40.2';
 let audioFragments = 0;
+let iceConfig = [];            // iceServers vindos do hello-ok (TURN, se configurado)
 let clockOffset = null;      // relogio do servidor (epoch ms) -> performance.now()
 let netDelay = null;         // captura -> navegador
 let playerLag = null;        // atraso do player MSE
@@ -285,7 +286,7 @@ let pc = null;
 async function initWebRTC() {
   canvas.style.display = 'none';
   video.style.display = 'block';
-  pc = new RTCPeerConnection({});
+  pc = new RTCPeerConnection({ iceServers: iceConfig });
   const t = pc.addTransceiver('video', { direction: 'recvonly' });
 
   // Sem isso o Chrome prefere VP8 e o servidor codifica em libvpx por software
@@ -374,6 +375,7 @@ ws.onmessage = (e) => {
       if (m.t === 'hello-ok') {
         mode = m.mode;
         if (m.audio) audioCodec = m.audio;
+        if (m.ice) iceConfig = m.ice;
         if (m.serverStart) serverStart = m.serverStart;
         if (mode === 'mse') initMSE();
         else if (mode === 'webrtc') initWebRTC();
