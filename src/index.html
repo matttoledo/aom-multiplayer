@@ -356,6 +356,10 @@ ws.onopen = () => {
   const declared = forced || (hasWebCodecs ? 'webcodecs' : 'mse');
   ws.send(JSON.stringify({ t: 'hello', decoder: declared }));
   ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
+  // Cloudflare fecha um WebSocket depois de ~100 s sem trafego. O video mantem o
+  // canal ocupado, mas um ping a cada 30 s cobre os periodos sem video e mantem o
+  // clockOffset atualizado (o relogio do navegador deriva de performance.now()).
+  setInterval(() => ws.send(JSON.stringify({ t: 'ping', ts: performance.now() })), 30000);
 };
 ws.onclose = () => { stats.textContent = 'conexao fechada'; };
 
