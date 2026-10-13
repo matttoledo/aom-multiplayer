@@ -11,7 +11,8 @@ Protocolo:
   cliente -> servidor: {"t":"hello","decoder":"webcodecs"|"mse"}
   servidor -> cliente: mensagem binaria = [1 byte kind][8 bytes double: timestamp do
     servidor em segundos][payload]
-    kind 0 = init segment (ftyp+moov), kind 1 = frame/fragmento
+    kind 0 = init segment de video (ftyp+moov), kind 1 = frame/fragmento de video,
+    kind 2 = init segment de audio, kind 3 = fragmento de audio
   cliente -> servidor: JSON
     {"t":"ping","ts":<performance.now()>}          -> {"t":"pong",...}
     {"t":"key","down":bool,"key":"a"}
@@ -44,6 +45,15 @@ VBV_BUFFER = os.environ.get("VBV_BUFFER", "28000000")
 PRESET = os.environ.get("PRESET", "p4")
 PORT = int(os.environ.get("PORT", "8080"))
 WINDOW_NAME = os.environ.get("WINDOW_NAME", "Age of Mythology").lower()
+
+# Audio por jogador: cada instancia tem um null-audio-sink proprio (scripts/
+# pipewire-slots.conf) e o stream daquela instancia e linkado a ele por
+# scripts/audio_route.py. Aqui o servidor captura <SLOT_PREFIX><SLOT>.monitor.
+SLOT = os.environ.get("SLOT", "1")
+SLOT_PREFIX = os.environ.get("SLOT_PREFIX", "aom_slot")
+AUDIO = os.environ.get("AUDIO", "1") == "1"
+AUDIO_BITRATE = os.environ.get("AUDIO_BITRATE", "128k")
+AUDIO_FRAGMENT_US = int(os.environ.get("AUDIO_FRAGMENT_US", "100000"))
 
 START_CODE = b"\x00\x00\x01"
 # NAL types 1..5 sao slices; 6=SEI, 7=SPS, 8=PPS, 9=AUD (delimiter, NAO e slice).
@@ -220,6 +230,66 @@ async def encoder_mp4(client, disp):
             proc.terminate()
 
 
+def audio_cmd(slot):
+    """Captura o monitor do slot do jogador e produz fMP4 fragmentado com AAC.
+
+    AAC em vez de Opus: AAC e suportado por MSE em todos os navegadores; Opus em
+    fMP4 funciona no Chrome mas nao e universal.
+
+    "-movflags" precisa do prefixo "+": frag_duration NAO e um movflags, e uma
+    AVOption do muxer mp4. Escrever "frag_duration+empty_moov" faz o ffmpeg sair
+    com "Conversion failed!" (medido).
+
+    frag_duration em vez de frag_every_frame: frag_every_frame gera um fragmento
+    por frame AAC (~21 ms) -> ~47 mensagens de ~110 bytes por segundo, chatter
+    demais para o WebSocket. Com 100 ms: 57 fragmentos em 6 s, ~1.7 kB cada.
+    """
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-f", "pulse", "-i", f"{SLOT_PREFIX}{slot}.monitor",
+        "-c:a", "aac", "-b:a", AUDIO_BITRATE,
+        "-movflags", "+empty_moov+default_base_moof",
+        "-frag_duration", str(AUDIO_FRAGMENT_US),
+        "-flush_packets", "1",
+        "-f", "mp4", "-",
+    ]
+
+
+async def encoder_audio(client, slot):
+    # kind 2 = init segment de audio, kind 3 = fragmento de audio
+    proc = await asyncio.create_subprocess_exec(
+        *audio_cmd(slot),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    sent = 0
+    t0 = time.time()
+
+    try:
+        init = b""
+        for _ in range(2):
+            typ, box = await read_box(proc.stdout)
+            init += box
+        await client.send(header(2, time.time()) + init)
+
+        while True:
+            typ, moof = await read_box(proc.stdout)
+            if typ != b"moof":
+                continue
+            typ2, mdat = await read_box(proc.stdout)
+            if typ2 != b"mdat":
+                continue
+            await client.send(header(3, time.time()) + moof + mdat)
+            sent += 1
+            if sent % 100 == 0:
+                print(f"audio: {sent} fragmentos em {time.time() - t0:.1f}s", flush=True)
+    except (asyncio.IncompleteReadError, Exception) as e:
+        print(f"audio encoder parou: {e}", flush=True)
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+
+
 def apply_input(disp, ev):
     t = ev.get("t")
     if t == "key":
@@ -269,11 +339,17 @@ async def handler(ws):
     print(f"cliente conectado; janela {window.id}; decoder={mode}", flush=True)
 
     if mode == "mse":
-        await ws.send(json.dumps({"t": "hello-ok", "mode": "mse"}))
+        await ws.send(json.dumps({"t": "hello-ok", "mode": "mse", "audio": "mp4a.40.2"}))
         task = asyncio.create_task(encoder_mp4(ws, disp))
     else:
-        await ws.send(json.dumps({"t": "hello-ok", "mode": "webcodecs"}))
+        await ws.send(json.dumps({"t": "hello-ok", "mode": "webcodecs", "audio": "mp4a.40.2"}))
         task = asyncio.create_task(encoder_annexb(ws, disp))
+
+    audio_task = None
+    if AUDIO:
+        # O audio vai por MSE mesmo no caminho WebCodecs: WebCodecs decodifica video,
+        # mas um SourceBuffer de audio e o caminho mais simples e universal para AAC.
+        audio_task = asyncio.create_task(encoder_audio(ws, SLOT))
 
     try:
         async for raw in ws:

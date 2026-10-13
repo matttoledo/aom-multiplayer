@@ -20,6 +20,8 @@
   <div>
     <div id="stats">conectando…</div>
     <button id="probe">medir latencia (probe)</button>
+    <button id="sound">ativar som</button>
+    <audio id="som" playsinline></audio>
     <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página.</div>
   </div>
 </div>
@@ -28,11 +30,19 @@ const canvas = document.getElementById('view');
 const ctx = canvas.getContext('2d');
 const video = document.getElementById('play');
 const stats = document.getElementById('stats');
+const audio = document.getElementById('som');
 
 let mode = null;             // 'webcodecs' ou 'mse', confirmado pelo servidor
 let decoder = null;
 let sb = null;               // SourceBuffer do MSE
 let queue = [];
+let asb = null;              // SourceBuffer de audio (AAC). Audio sempre vai por MSE:
+                             // WebCodecs decodifica video, mas AudioDecoder exigiria
+                             // extrair o AAC do fMP4; um SourceBuffer separado e mais
+                             // simples e funciona nos dois caminhos.
+let audioQueue = [];
+let audioCodec = 'mp4a.40.2';
+let audioFragments = 0;
 let clockOffset = null;      // relogio do servidor (epoch ms) -> performance.now()
 let netDelay = null;         // captura -> navegador
 let playerLag = null;        // atraso do player MSE
@@ -41,7 +51,7 @@ let renderLatency = null;    // captura -> frame na tela (medido, nao estimado)
 let fragmentsAppended = 0;
 let framesOut = 0;
 let fpsWindow = [];
-let diag = { binarias: 0, texto: 0, decodeErr: '-', mseErr: '-' };
+let diag = { binarias: 0, texto: 0, decodeErr: '-', mseErr: '-', audioErr: '-' };
 let rtcStats = {};
 
 /* Estatisticas reais do recebedor WebRTC: o que o navegador realmente recebeu e
@@ -129,6 +139,9 @@ function updateStats() {
     'LATENCIA MEDIDA POR PROBE:      ' + (probeLatency == null ? '-' : probeLatency.toFixed(0) + ' ms') + '\n' +
     'erro decoder:         ' + diag.decodeErr + '\n' +
     'erro mse:             ' + diag.mseErr + '\n' +
+    'audio:                ' + audioFragments + ' fragmentos' +
+      (audioFragments ? ' | ' + (audio.paused ? 'pausado (clique "ativar som")' : 'tocando') : '') +
+      (diag.audioErr !== '-' ? ' | ' + diag.audioErr : '') + '\n' +
     // clockOffset mapeia epoch-ms -> performance.now(). Como performance.now() conta
     // desde o load da pagina, o numero e enorme e negativo por natureza: nao e erro,
     // e a origem do relogio. O que importa e que seja estavel.
@@ -200,6 +213,43 @@ function drain() {
   if (item.kind === 1) fragmentsAppended++;
   sb.appendBuffer(item.payload);
 }
+
+/* ---------- audio (MSE, kinds 2 e 3) ---------- */
+function initAudioMSE() {
+  const ms = new MediaSource();
+  audio.src = URL.createObjectURL(ms);
+  ms.addEventListener('sourceopen', () => {
+    try {
+      asb = ms.addSourceBuffer('audio/mp4; codecs="' + audioCodec + '"');
+    } catch (e) {
+      diag.audioErr = 'addSourceBuffer: ' + e.message;
+      updateStats();
+      return;
+    }
+    asb.mode = 'segment';
+    try { asb.lowLatency = true; } catch (e) { /* nem todo navegador aceita */ }
+    asb.addEventListener('updateend', drainAudio);
+    asb.addEventListener('error', () => { diag.audioErr = 'sourcebuffer error'; updateStats(); });
+    drainAudio();
+  });
+}
+
+function drainAudio() {
+  if (!asb || asb.updating || !audioQueue.length) return;
+  const item = audioQueue.shift();
+  if (item.kind === 3) audioFragments++;
+  asb.appendBuffer(item.payload);
+}
+
+// O navegador bloqueia autoplay com som: play() so funciona depois de um gesto do
+// usuario (o botao "ativar som", ou o primeiro clique na tela).
+function enableSound() {
+  audio.play().then(() => { diag.audioErr = '-'; }).catch((e) => {
+    diag.audioErr = 'play bloqueado: ' + e.message;
+    updateStats();
+  });
+}
+document.getElementById('sound').addEventListener('click', enableSound);
 
 // latencia real: momento em que o frame vai para a tela menos o momento em que foi capturado
 function onRendered(now, meta) {
@@ -295,7 +345,9 @@ async function initWebRTC() {
 
 /* ---------- protocolo ---------- */
 const forced = new URLSearchParams(location.search).get('mode');
-const ws = new WebSocket('ws://' + location.host);
+// Cloudflare serve a pagina por HTTPS -> o WebSocket precisa ser wss. Em http://
+// (localhost ou LAN) ws:// continua correto.
+const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
 ws.binaryType = 'arraybuffer';
 
 ws.onopen = () => {
@@ -317,10 +369,12 @@ ws.onmessage = (e) => {
       if (m.serverStart) serverStart = m.serverStart;
       if (m.t === 'hello-ok') {
         mode = m.mode;
+        if (m.audio) audioCodec = m.audio;
         if (m.serverStart) serverStart = m.serverStart;
         if (mode === 'mse') initMSE();
         else if (mode === 'webrtc') initWebRTC();
         else decoder = makeDecoder();
+        if (audioCodec) initAudioMSE();
       } else if (m.t === 'answer') {
         if (m.serverStart) serverStart = m.serverStart;
         if (pc) pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
@@ -349,6 +403,12 @@ ws.onmessage = (e) => {
   const serverTs = new DataView(d, bytes.byteOffset + 1, 8).getFloat64(0, true);
   const payload = bytes.subarray(9);
   if (clockOffset != null) netDelay = performance.now() - (serverTs * 1000 + clockOffset);
+
+  if (kind === 2 || kind === 3) {
+    audioQueue.push({ kind, payload });
+    drainAudio();
+    return;
+  }
 
   if (mode === 'mse') {
     queue.push({ kind, payload });
