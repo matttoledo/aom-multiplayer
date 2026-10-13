@@ -1,0 +1,43 @@
+# Sem binários neste repositório.
+*.exe
+*.dll
+*.so
+*.bin
+*.snap
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.mp4
+*.mkv
+*.mov
+*.wav
+*.mp3
+*.opus
+*.pdf
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.7z
+*.deb
+*.rpm
+*.iso
+*.deb
+*.whl
+*.pyd
+*.pyc
+
+# Ambiente / artefatos locais
+.venv/
+__pycache__/
+*.log
+.DS_Store
+out/
+*.strace
+
+# Arquivos do jogo (pirata) — nunca versionar
+game/
+*.ini

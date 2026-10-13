@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<title>AoMY — stream</title>
+<style>
+  body { margin: 0; background: #111; color: #ddd; font: 14px/1.4 system-ui, sans-serif; }
+  #wrap { display: flex; gap: 12px; padding: 12px; }
+  canvas, video { background: #000; border: 1px solid #333; width: 1280px; height: 720px; }
+  #stats { font: 12px/1.7 ui-monospace, monospace; color: #8ab; white-space: pre; }
+  #hint { color: #777; font-size: 12px; max-width: 320px; }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div>
+    <canvas id="view" width="1280" height="720"></canvas>
+    <video id="play" muted playsinline style="display:none"></video>
+  </div>
+  <div>
+    <div id="stats">conectando…</div>
+    <button id="probe">medir latencia (probe)</button>
+    <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página.</div>
+  </div>
+</div>
+<script>
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+const video = document.getElementById('play');
+const stats = document.getElementById('stats');
+
+let mode = null;             // 'webcodecs' ou 'mse', confirmado pelo servidor
+let decoder = null;
+let sb = null;               // SourceBuffer do MSE
+let queue = [];
+let clockOffset = null;      // relogio do servidor (epoch ms) -> performance.now()
+let netDelay = null;         // captura -> navegador
+let playerLag = null;        // atraso do player MSE
+let serverStart = null;      // epoch ms do inicio do pipeline no servidor
+let renderLatency = null;    // captura -> frame na tela (medido, nao estimado)
+let fragmentsAppended = 0;
+let framesOut = 0;
+let fpsWindow = [];
+let diag = { binarias: 0, texto: 0, decodeErr: '-', mseErr: '-' };
+let rtcStats = {};
+
+/* Estatisticas reais do recebedor WebRTC: o que o navegador realmente recebeu e
+   quanto tempo o jitter buffer dele segurou cada frame. */
+async function pollStats() {
+  if (!pc) return;
+  try {
+    const s = await pc.getStats();
+    s.forEach((r) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'video') {
+        rtcStats.recebidos = r.packetsReceived;
+        rtcStats.perdidos = r.packetsLost;
+        rtcStats.fpsRtc = r.framesPerSecond;
+        rtcStats.decodificados = r.framesDecoded;
+        rtcStats.jitter = (r.jitterBufferDelay && r.jitterBufferEmittedCount)
+          ? (r.jitterBufferDelay / r.jitterBufferEmittedCount) * 1000 : null;
+        rtcStats.decoder = r.decoderImplementation;
+        rtcStats.limitacao = r.qualityLimitationReason;
+        rtcStats.nack = r.nackCount;
+        rtcStats.pli = r.pliCount;
+        // inbound-rtp NAO tem codecName no Chrome: o codec vem do objeto apontado por
+        // codecId. Sem isso o painel mostrava "-".
+        rtcStats.codecName = r.codecName;
+        if (r.codecId) {
+          const c = stats.get(r.codecId);
+          if (c && c.mimeType) rtcStats.codecName = c.mimeType;
+        }
+        rtcStats.keyframes = r.keyFramesDecoded;
+        rtcStats.qp = r.qp;
+        rtcStats.bytes = r.bytesReceived;
+        const now = performance.now();
+        if (rtcStats.prevBytes != null && now > rtcStats.prevTime) {
+          // bytes/segundo * 8 = bps. Dividir por 1000 para kbps.
+          rtcStats.kbps = (r.bytesReceived - rtcStats.prevBytes) /
+                           ((now - rtcStats.prevTime) / 1000) * 8 / 1000;
+        }
+        rtcStats.prevBytes = r.bytesReceived;
+        rtcStats.prevTime = now;
+      }
+    });
+    updateStats();
+  } catch (e) { /* ignore */ }
+  setTimeout(pollStats, 2000);
+}
+
+/* ---------- probe de latencia real ----------
+   O servidor desenha um quadrado magenta no display e informa o instante (epoch).
+   A pagina procura esse pixel no frame ja na tela; quando ele aparece, a diferenca
+   e a latencia captura->tela medida, sem depender de mediaTime nem de suposicoes.
+*/
+const MARK = { x: 1232, y: 696 };   // centro do marcador: janela 1200,680 64x32
+const sampleCanvas = document.createElement('canvas');
+sampleCanvas.width = 1280;
+sampleCanvas.height = 720;
+const sctx = sampleCanvas.getContext('2d', { willReadFrequently: true });
+let probe = null;          // { drawnServer: epoch s }
+let probeLatency = null;
+
+function checkMarker(context) {
+  if (!probe || clockOffset == null) return;
+  const p = context.getImageData(MARK.x, MARK.y, 1, 1).data;
+  // o H.264 e perdas: o magenta chega como (249,0,254), nao (255,0,255)
+  if (p[0] > 200 && p[1] < 60 && p[2] > 200) {
+    probeLatency = performance.now() - (probe.drawnServer * 1000 + clockOffset);
+    probe = null;
+    updateStats();
+  }
+}
+
+function totalLatency() {
+  if (netDelay == null) return null;
+  return netDelay + (playerLag || 0);
+}
+
+function updateStats() {
+  stats.textContent =
+    'modo:                 ' + (mode || '-') + '\n' +
+    'binarias:             ' + diag.binarias + '\n' +
+    'frames render:        ' + framesOut + '\n' +
+    'fps:                  ' + (fpsWindow.length > 1 ? ((fpsWindow.length - 1) / ((fpsWindow[fpsWindow.length - 1] - fpsWindow[0]) / 1000)).toFixed(1) : '0.0') + '\n' +
+    'fragmentos appendados:  ' + fragmentsAppended + '\n' +
+    'delay de rede:        ' + (netDelay == null ? '-' : netDelay.toFixed(0) + ' ms') + '\n' +
+    'atraso do player:     ' + (playerLag == null ? '-' : playerLag.toFixed(0) + ' ms') + '\n' +
+    'LATENCIA REAL (captura->tela): ' + (renderLatency == null ? '-' : renderLatency.toFixed(0) + ' ms') + '\n' +
+    'LATENCIA MEDIDA POR PROBE:      ' + (probeLatency == null ? '-' : probeLatency.toFixed(0) + ' ms') + '\n' +
+    'erro decoder:         ' + diag.decodeErr + '\n' +
+    'erro mse:             ' + diag.mseErr + '\n' +
+    // clockOffset mapeia epoch-ms -> performance.now(). Como performance.now() conta
+    // desde o load da pagina, o numero e enorme e negativo por natureza: nao e erro,
+    // e a origem do relogio. O que importa e que seja estavel.
+    'offset de relogio:    ' + (clockOffset == null ? '-' : (clockOffset / 1e6).toFixed(3) + ' Ms (origem do relogio)') +
+    (pc ? '\n\n--- WebRTC ---\n' +
+      'codec negociado:      ' + (rtcStats.codecName ?? '-') + '\n' +
+      'bitrate recebido:     ' + (rtcStats.kbps == null ? '-' : rtcStats.kbps.toFixed(0) + ' kbps') + '\n' +
+      'keyframes decodificados: ' + (rtcStats.keyframes ?? '-') + '\n' +
+      'QP medio:             ' + (rtcStats.qp ?? '-') + '\n' +
+      'preferencia de codec: ' + (diag.codecPref ?? '-') + '\n' +
+      'pacotes recebidos:    ' + (rtcStats.recebidos ?? '-') + '\n' +
+      'pacotes perdidos:     ' + (rtcStats.perdidos ?? '-') + '\n' +
+      'fps no decoder:       ' + (rtcStats.fpsRtc ?? '-') + '\n' +
+      'frames decodificados: ' + (rtcStats.decodificados ?? '-') + '\n' +
+      'jitter buffer:        ' + (rtcStats.jitter == null ? '-' : rtcStats.jitter.toFixed(0) + ' ms') + '\n' +
+      'decoder:              ' + (rtcStats.decoder ?? '-') + '\n' +
+      'limitacao:            ' + (rtcStats.limitacao ?? '-') + '\n' +
+      'NACK / PLI:           ' + (rtcStats.nack ?? '-') + ' / ' + (rtcStats.pli ?? '-')
+      : '');
+}
+
+/* ---------- WebCodecs ---------- */
+function makeDecoder() {
+  const d = new VideoDecoder({
+    output: (frame) => {
+      framesOut++;
+      ctx.drawImage(frame, 0, 0);
+      frame.close();
+      checkMarker(ctx);
+      const now = performance.now();
+      fpsWindow.push(now);
+      while (fpsWindow.length > 0 && now - fpsWindow[0] > 5000) fpsWindow.shift();
+      updateStats();
+    },
+    error: (e) => { diag.decodeErr = e.message; updateStats(); }
+  });
+  d.configure({ codec: 'avc1.42001f', optimizeForLatency: true });
+  return d;
+}
+
+/* ---------- MSE ---------- */
+function initMSE() {
+  canvas.style.display = 'none';
+  video.style.display = 'block';
+  const ms = new MediaSource();
+  video.src = URL.createObjectURL(ms);
+  video.muted = true;
+  ms.addEventListener('sourceopen', () => {
+    try {
+      sb = ms.addSourceBuffer('video/mp4; codecs="avc1.42001f"');
+    } catch (e) {
+      diag.mseErr = 'addSourceBuffer: ' + e.message;
+      updateStats();
+      return;
+    }
+    sb.mode = 'segment';
+    try { sb.lowLatency = true; } catch (e) { /* nem todo navegador aceita */ }
+    sb.addEventListener('updateend', drain);
+    sb.addEventListener('error', () => { diag.mseErr = 'sourcebuffer error'; updateStats(); });
+    video.play().catch(() => {});
+    video.requestVideoFrameCallback(onRendered);
+    drain();
+  });
+}
+
+function drain() {
+  if (!sb || sb.updating || !queue.length) return;
+  const item = queue.shift();
+  if (item.kind === 1) fragmentsAppended++;
+  sb.appendBuffer(item.payload);
+}
+
+// latencia real: momento em que o frame vai para a tela menos o momento em que foi capturado
+function onRendered(now, meta) {
+  if (serverStart != null && clockOffset != null && meta && meta.mediaTime != null) {
+    // serverStart esta em segundos de epoch; clockOffset e mediaTime*1000 em ms
+    renderLatency = now - (serverStart * 1000 + meta.mediaTime * 1000 + clockOffset);
+    framesOut++;
+    fpsWindow.push(now);
+    while (fpsWindow.length > 0 && now - fpsWindow[0] > 5000) fpsWindow.shift();
+    updateStats();
+  }
+  // o frame acabou de ir para a tela: e aqui que o probe deve ser lido
+  try {
+    sctx.drawImage(video, 0, 0);
+    checkMarker(sctx);
+  } catch (e) { /* video ainda sem dados */ }
+  video.requestVideoFrameCallback(onRendered);
+}
+
+function keepLive() {
+  if (!sb || !sb.buffered.length) return;
+  const end = sb.buffered.end(sb.buffered.length - 1);
+  const lag = (end - video.currentTime) * 1000;
+  playerLag = lag;
+  if (lag > 250) video.currentTime = end;   // mantem no live edge
+  updateStats();
+}
+video.addEventListener('timeupdate', keepLive);
+
+/* ---------- WebRTC ---------- */
+let pc = null;
+
+async function initWebRTC() {
+  canvas.style.display = 'none';
+  video.style.display = 'block';
+  pc = new RTCPeerConnection({});
+  const t = pc.addTransceiver('video', { direction: 'recvonly' });
+
+  // Sem isso o Chrome prefere VP8 e o servidor codifica em libvpx por software
+  // (~1 Mbps) -> tela pixelizada. Forcar H264 faz o servidor usar NVENC.
+  // Ojo: o Chrome pode devolver "video/H264" com H maiusculo -> comparar case-insensitive.
+  try {
+    // A API certa e RTCRtpReceiver.getCapabilities('video').codecs.
+    // RTCRtpTransceiver.getReceiverCapabilities NAO existe no Chromium (medido:
+    // "is not a function") -> o try caia, a preferencia nunca era aplicada, e o
+    // Chrome negociava VP8 -> o servidor codificava em libvpx por software.
+    const caps = (RTCRtpReceiver.getCapabilities('video') || {}).codecs
+      || (typeof RTCRtpTransceiver.getReceiverCapabilities === 'function'
+          ? RTCRtpTransceiver.getReceiverCapabilities('video') : []);
+    const h264 = caps.filter((c) => c.mimeType.toLowerCase() === 'video/h264');
+    if (h264.length) {
+      // NAO filtrar só o H264: sem o rtx pareado (apt = payloadType do H264) o
+      // navegador nao pede NACK e o servidor nao retransmite -> perda vira quadro
+      // perdido ate o proximo IDR. Medido: com rtx na preferencia, o aiortc
+      // retransmite 100% dos NACKs e nao ha falha de decode em 5%/10% de perda.
+      const pts = new Set(h264.map((c) => c.payloadType));
+      const rtx = caps.filter((c) =>
+        c.mimeType.toLowerCase() === 'video/rtx' && c.parameters && pts.has(c.parameters.apt));
+      t.setCodecPreferences(h264.concat(rtx));
+      diag.codecPref = 'h264 forcado + rtx ' + rtx.length;
+    } else {
+      diag.codecPref = 'h264 indisponivel';
+    }
+  } catch (e) {
+    diag.codecPref = 'setCodecPreferences falhou: ' + e.message;
+  }
+
+  pc.ontrack = (ev) => {
+    video.srcObject = ev.streams[0];
+    video.play().catch(() => {});
+    video.requestVideoFrameCallback(onRendered);
+  };
+
+  // aiortc do servidor nao suporta trickle ICE: os candidatos so entram no ICE se
+  // estiverem dentro do SDP. Por isso a oferta vai depois que o gathering completa.
+  let sentOffer = false;
+  const sendOffer = () => {
+    if (sentOffer || !pc.localDescription) return;
+    sentOffer = true;
+    diag.iceGathering = pc.iceGatheringState;
+    ws.send(JSON.stringify({ t: 'offer', sdp: pc.localDescription.sdp }));
+  };
+  pc.onicegatheringstatechange = () => {
+    diag.iceGathering = pc.iceGatheringState;
+    if (pc.iceGatheringState === 'complete') sendOffer();
+  };
+
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);   // gathering comeca aqui
+  setTimeout(sendOffer, 3000);           // fallback, nao fica travado
+  pollStats();
+}
+
+/* ---------- protocolo ---------- */
+const forced = new URLSearchParams(location.search).get('mode');
+const ws = new WebSocket('ws://' + location.host);
+ws.binaryType = 'arraybuffer';
+
+ws.onopen = () => {
+  stats.textContent = 'conectado, aguardando hello…';
+  const hasWebCodecs = typeof VideoDecoder !== 'undefined';
+  const declared = forced || (hasWebCodecs ? 'webcodecs' : 'mse');
+  ws.send(JSON.stringify({ t: 'hello', decoder: declared }));
+  ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
+};
+ws.onclose = () => { stats.textContent = 'conexao fechada'; };
+
+ws.onmessage = (e) => {
+  const d = e.data;
+  if (typeof d === 'string') {
+    diag.texto++;
+    try {
+      const m = JSON.parse(d);
+      // qualquer mensagem pode trazer a origem de mediaTime (hello-ok, answer, start)
+      if (m.serverStart) serverStart = m.serverStart;
+      if (m.t === 'hello-ok') {
+        mode = m.mode;
+        if (m.serverStart) serverStart = m.serverStart;
+        if (mode === 'mse') initMSE();
+        else if (mode === 'webrtc') initWebRTC();
+        else decoder = makeDecoder();
+      } else if (m.t === 'answer') {
+        if (m.serverStart) serverStart = m.serverStart;
+        if (pc) pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
+      } else if (m.t === 'ice') {
+        if (pc) pc.addIceCandidate(m.candidate).catch(() => {});
+      } else if (m.t === 'pong') {
+        const now = performance.now();
+        const rtt = now - m.client_ts;
+        clockOffset = (m.client_ts + rtt / 2) - m.server_ts * 1000;
+      } else if (m.t === 'probe-at') {
+        probe = { drawnServer: m.drawn };
+      } else if (m.t === 'error') {
+        stats.textContent = 'erro: ' + m.msg;
+        return;
+      }
+    } catch (_) {}
+    updateStats();
+    return;
+  }
+
+  const bytes = new Uint8Array(d);
+  if (bytes.length < 9) return;
+  diag.binarias++;
+
+  const kind = bytes[0];
+  const serverTs = new DataView(d, bytes.byteOffset + 1, 8).getFloat64(0, true);
+  const payload = bytes.subarray(9);
+  if (clockOffset != null) netDelay = performance.now() - (serverTs * 1000 + clockOffset);
+
+  if (mode === 'mse') {
+    queue.push({ kind, payload });
+    drain();
+    return;
+  }
+
+  // webcodecs: payload e uma access unit Annex-B; kind 1 = keyframe
+  if (!decoder) decoder = makeDecoder();
+  if (decoder.state !== 'configured') return;
+  try {
+    decoder.decode({
+      type: kind === 1 ? 'key' : 'delta',
+      timestamp: Math.round(serverTs * 1000),
+      data: payload
+    });
+  } catch (err) {
+    diag.decodeErr = err.message;
+  }
+  updateStats();
+};
+
+/* ---------- input ---------- */
+function send(obj) {
+  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
+}
+
+document.getElementById('probe').addEventListener('click', () => {
+  probeLatency = null;
+  probe = null;
+  send({ t: 'probe' });
+});
+
+function pos(e) {
+  const r = target().getBoundingClientRect();
+  return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+}
+
+function target() { return mode === 'webcodecs' ? canvas : video; }
+
+// sem isso o Chrome abre o menu de contexto no botao direito e o clique nunca chega ao jogo
+document.addEventListener('contextmenu', (e) => {
+  if (target().contains(e.target)) e.preventDefault();
+});
+
+document.addEventListener('mousedown', (e) => {
+  if (!target().contains(e.target)) return;
+  const p = pos(e);
+  send({ t: 'mouse', button: e.button + 1, x: p.x, y: p.y, down: true });
+});
+document.addEventListener('mouseup', (e) => {
+  if (!target().contains(e.target)) return;
+  const p = pos(e);
+  send({ t: 'mouse', button: e.button + 1, x: p.x, y: p.y, down: false });
+});
+document.addEventListener('mousemove', (e) => {
+  if (!target().contains(e.target)) return;
+  const p = pos(e);
+  send({ t: 'move', x: p.x, y: p.y });
+});
+
+document.addEventListener('keydown', (e) => { send({ t: 'key', key: e.key, down: true }); });
+document.addEventListener('keyup', (e) => { send({ t: 'key', key: e.key, down: false }); });
+</script>
+</body>
+</html>
