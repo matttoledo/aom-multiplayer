@@ -38,6 +38,6 @@ __pycache__/
 out/
 *.strace
 
-# Arquivos do jogo (pirata) — nunca versionar
+# Arquivos do jogo — nunca versionar
 game/
 *.ini

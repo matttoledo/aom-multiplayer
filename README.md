@@ -65,10 +65,3 @@ pixelização). `setCodecPreferences` deve incluir o codec `video/rtx` pareado c
   `OpenEncodeSessionEx failed: incompatible client key (21)`).
 - Teto prático de CPU: **~6 jogadores**.
 - Latência do probe: **133–136 ms** (caminho MSE: 225 ms).
-
-## Nota sobre o jogo
-
-O binário analisado é uma cópia pirata (AppId 266840) com crack CODEX (`steam_emu.ini`).
-A varredura de 80.874 arquivos não encontrou malware — é RiskWare, não payload. A confirmação
-definitiva depende de verificação externa (VirusTotal). Por isso **nenhum binário do jogo está
-aqui**, e este repositório é privado.
