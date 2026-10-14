@@ -126,7 +126,7 @@ AOM_SESSION_TOKEN = os.environ.get("AOM_SESSION_TOKEN", "")
 # manda Origin, entao a protecao continua.
 ALLOWED_ORIGINS = [
     None,
-    "https://aom.matheustoledo.dev",
+    "https://game.matheustoledo.dev",
     "http://192.168.15.17:8081",
     "http://localhost:8081",
     "http://127.0.0.1:8081",

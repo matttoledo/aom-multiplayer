@@ -257,7 +257,16 @@ cliente; agora sobrevive a sessões sucessivas.
 Fora do escopo agora (anotado, não feito): áudio Opus no WebRTC; keyframe a cada 1–2 s e
 4–6 Mbps em vez de 17.
 
-Falta do lado do Matheus: Access self-hosted para `aom.matheustoledo.dev` (criar antes do
-hostname), hostname no túnel → `http://npm:80`, reserva de DHCP no roteador Vivo
-(MAC `7c:10:c9:ac:4d:a7` → `192.168.15.17`), e o `aom.conf` no orange-juice-box (PR aberto
-por ele, deploy manual depois do merge).
+Falta do lado do Matheus: Access self-hosted para `game.matheustoledo.dev` (criado em
+2026-10-14; o record CNAME `game.matheustoledo.dev → 18d4763d-f0e7-4447-9799-40bc36858295.cfargotunnel.com`
+é consequência da rota, não um record manual), rota do túnel → `http://security_modsecurity:8080`
+— o WAF, não o NPM direto: o modsecurity tem `BACKEND=http://infrastructure_npm` e `PORT=8080`,
+e está na `public_network` junto com o túnel, então resolve. Reserva de DHCP no roteador Vivo
+(MAC `7c:10:c9:ac:4d:a7` → `192.168.15.17`), e o `game.conf` no orange-juice-box (PR #33,
+deploy manual depois do merge).
+
+Medido no WAF vivo em 2026-10-14 (paranoia 2, bloqueando, ANOMALY_INBOUND=5): `GET /`,
+`GET /?t=<token>` com caracteres `-`/`_` e o upgrade de WebSocket com `Origin` → 200, nenhuma
+regra do CRS casou. Depois do `101` os frames do WebSocket não são inspecionados, então o SDP
+não passa pelo CRS. O `proxy_read_timeout` do WAF é 36000 s, e o keepalive de 20 s do servidor
+renova o timeout em qualquer hop.
