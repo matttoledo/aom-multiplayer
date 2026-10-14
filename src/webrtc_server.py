@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import time
+import urllib.request
 
 import av
 import aiortc.codecs
@@ -37,8 +38,9 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import MediaStreamTrack
-from aiortc.rtcicetransport import RTCIceCandidate
+from aiortc.rtcicetransport import RTCIceCandidate, RTCIceGatherer
 from aiortc.sdp import candidate_from_sdp
+from aioice.ice import TransportPolicy
 
 import websockets
 from websockets.datastructures import Headers
@@ -72,24 +74,81 @@ PORT = int(os.environ.get("PORT", "8081"))
 # TURN o caminho WebRTC funciona so para cliente que alcanca o asus diretamente
 # (mesma LAN ou malha). Medido no asus: STUN UDP e TCP para Google e Cloudflare
 # todos com timeout, e TCP 3478 tambem - o egress permite TCP 80/443 e nada mais.
-# aioice (backend do aiortc) suporta STUN/TURN, entao basta um TURN alcancavel.
-TURN_URL = os.environ.get("TURN_URL", "")
-TURN_USER = os.environ.get("TURN_USER", "")
-TURN_PASS = os.environ.get("TURN_PASS", "")
+#
+# Por isso o TURN da Cloudflare e o unico caminho possivel: ela expoe
+#   turns:turn.cloudflare.com:443?transport=tcp
+# que e TLS na 443, exatamente o egress que o asus tem. aioice suporta turns com
+# TLS (aiortc define turn_ssl=True quando o esquema e "turns"), medido no codigo:
+# aiortc/rtcicetransport.py:133.
+#
+# Credenciais: o TURN key e um segredo de longo prazo que fica no servidor; cada
+# conexao gera credenciais de curta duracao (ttl) via API. Nao hardcodear o token:
+# vir de variavel de ambiente.
+CF_TURN_KEY_ID = os.environ.get("CF_TURN_KEY_ID", "")
+CF_TURN_API_TOKEN = os.environ.get("CF_TURN_API_TOKEN", "")
+CF_TURN_TTL = int(os.environ.get("CF_TURN_TTL", "86400"))
+RELAY_ONLY = os.environ.get("RELAY_ONLY", "1") == "1"
+
+_ORIG_GATHERER_INIT = RTCIceGatherer.__init__
 
 
-def ice_servers():
-    if not TURN_URL:
+def _gatherer_init(self, iceServers=None, local_username=None, local_password=None):
+    """Forcar politica RELAY no lado do servidor quando ha TURN.
+
+    O aiortc nao expoe transport_policy (aioice/ice.py:446 aceita, mas o aiortc nao
+    passa). Sem isso o ICE tenta primeiro os candidatos host do asus - IPs de LAN que
+    um amigo remoto nunca alcanca - e o relay so entra depois. Com RELAY o gatherer
+    devolve apenas o candidato do TURN, que e o unico caminho possivel.
+    """
+    _ORIG_GATHERER_INIT(self, iceServers, local_username, local_password)
+    if iceServers and RELAY_ONLY:
+        self._connection._transport_policy = TransportPolicy.RELAY
+
+
+RTCIceGatherer.__init__ = _gatherer_init
+
+
+async def turn_credentials():
+    """Credenciais de TURN de curta duracao, uma por conexao.
+
+    Retorna [] quando nao ha credenciais configuradas (ai, o caminho WebRTC so
+    funciona para cliente na mesma LAN).
+    """
+    if not (CF_TURN_KEY_ID and CF_TURN_API_TOKEN):
         return []
-    return [RTCIceServer(urls=[TURN_URL], username=TURN_USER, credential=TURN_PASS)]
 
+    def fetch():
+        req = urllib.request.Request(
+            f"https://rtc.live.cloudflare.com/v1/turn/keys/{CF_TURN_KEY_ID}/credentials/generate-ice-servers",
+            data=json.dumps({"ttl": CF_TURN_TTL}).encode(),
+            headers={
+                "Authorization": f"Bearer {CF_TURN_API_TOKEN}",
+                "Content-Type": "application/json",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return json.loads(r.read().decode())
 
-def ice_for_client():
-    # o navegador precisa dos mesmos servidores; o cliente cria o
-    # RTCPeerConnection antes do answer, entao isso vai no hello-ok
-    if not TURN_URL:
+    try:
+        data = await asyncio.to_thread(fetch)
+    except Exception as e:
+        print(f"TURN: credenciais falharam: {e}", flush=True)
         return []
-    return [{"urls": [TURN_URL], "username": TURN_USER, "credential": TURN_PASS}]
+
+    servers = []
+    for s in data.get("iceServers") or []:
+        urls = s.get("urls") or ([s["url"]] if s.get("url") else [])
+        servers.append(RTCIceServer(urls=urls, username=s.get("username"), credential=s.get("credential")))
+    return servers
+
+
+def ice_json(servers):
+    """Mesma coisa para o navegador: o cliente cria o RTCPeerConnection antes do
+    answer, entao as credenciais vao no hello-ok."""
+    return [
+        {"urls": s.urls, "username": s.username, "credential": s.credential}
+        for s in servers
+    ]
 WINDOW_NAME = os.environ.get("WINDOW_NAME", "Age of Mythology").lower()
 
 # ATENCAO: no FFmpeg 7 (PyAV 17) as AVOptions do h264_nvenc NAO incluem
@@ -339,7 +398,8 @@ async def handler(ws):
         except Exception:
             pass
 
-    pc = RTCPeerConnection(ice_servers())
+    servers = await turn_credentials()
+    pc = RTCPeerConnection(servers)
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
 
@@ -355,7 +415,14 @@ async def handler(ws):
     def on_state():
         print("estado:", pc.connectionState, flush=True)
 
-    await ws.send(json.dumps({"t": "hello-ok", "mode": "webrtc", "ice": ice_for_client()}))
+    await ws.send(json.dumps({
+        "t": "hello-ok",
+        "mode": "webrtc",
+        "ice": ice_json(servers),
+        # com TURN configurado, forcar relay: sem isso o navegador tenta primeiro o
+        # candidato host, que nunca funciona para um cliente remoto
+        "relay": bool(servers),
+    }))
 
     try:
         async for raw in ws:
