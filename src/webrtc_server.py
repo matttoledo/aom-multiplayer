@@ -396,10 +396,39 @@ def find_window(disp):
     return by_size(root)
 
 
-def apply_input(disp, ev):
+# Atalhos de sistema que o input remoto nao pode injetar: eles atingem o desktop do
+# asus, nao o jogo. O servidor acompanha os modificadores pressionados porque o
+# cliente manda a tecla pelo nome (e.key) e a combinacao so pode ser decidida aqui.
+MOD_KEYS = {"Alt": "alt", "AltGr": "alt", "Control": "ctrl", "Meta": "meta", "Shift": "shift"}
+BLOCKED_KEYS = {"Meta", "Super_L", "Super_R"}
+BLOCKED_COMBOS = {("alt", "Tab"), ("alt", "F4"), ("alt", "F2"),
+                  ("ctrl+alt", "Delete"), ("ctrl+alt", "Escape")}
+
+
+def blocked_key(key, pressed):
+    if key in BLOCKED_KEYS:
+        return True
+    if key in ("Tab", "F4", "F2") and "alt" in pressed:
+        return True
+    if key in ("Delete", "Escape") and {"ctrl", "alt"} <= pressed:
+        return True
+    return False
+
+
+def apply_input(disp, ev, pressed, stats):
     t = ev.get("t")
     if t == "key":
-        sym = string_to_keysym(ev.get("key", ""))
+        key = ev.get("key", "")
+        mod = MOD_KEYS.get(key)
+        if mod:
+            if ev.get("down"):
+                pressed.add(mod)
+            else:
+                pressed.discard(mod)
+        if blocked_key(key, pressed):
+            stats["blocked"] += 1
+            return
+        sym = string_to_keysym(key)
         if not sym:
             return
         code = disp.keysym_to_keycode(sym)
@@ -451,6 +480,9 @@ async def handler(ws):
         return
 
     print(f"entrada: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+    pressed = set()          # modificadores atualmente pressionados por este cliente
+    stats = {"blocked": 0}   # atalhos de sistema descartados antes de injetar
 
     if ev.get("decoder") != "webrtc":
         await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
@@ -551,7 +583,7 @@ async def handler(ws):
                 await ws.send(json.dumps({"t": "probe-at", "drawn": drawn}))
                 asyncio.create_task(hide_later(marker))
             else:
-                apply_input(disp, ev)
+                apply_input(disp, ev, pressed, stats)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
@@ -563,7 +595,7 @@ async def handler(ws):
         dur = time.time() - info["t0"]
         # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
         print(f"saida: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"duracao={dur:.0f}s", flush=True)
+              f"duracao={dur:.0f}s atalhos bloqueados={stats['blocked']}", flush=True)
 
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
