@@ -130,6 +130,49 @@ def load_env(path):
 
 load_env(ENV_FILE)
 AOM_SESSION_TOKEN = os.environ.get("AOM_SESSION_TOKEN", "")
+MAX_PLAYERS = 8   # teto do NVENC: 8 sessoes simultaneas
+
+
+def load_players():
+    """Um processo so serve todos os jogadores: o token escolhe a tela e o slot.
+
+    Jogador N: token AOM_TOKEN_N (segredo, no .env), tela AOM_DISPLAY_N (padrao
+    :N+1, porque :1 e o dummy e :2 o primeiro Xorg com GPU), slot de audio N.
+    AOM_SESSION_TOKEN continua valendo como jogador 1, na tela de DISPLAY/SLOT.
+    """
+    players = {}
+    for n in range(1, MAX_PLAYERS + 1):
+        tok = os.environ.get(f"AOM_TOKEN_{n}", "")
+        if n == 1 and not tok:
+            tok = AOM_SESSION_TOKEN
+        if not tok:
+            continue
+        default_display = DISPLAY_NAME if n == 1 else f":{n + 1}"
+        default_slot = SLOT if n == 1 else str(n)
+        players[n] = {
+            "token": tok,
+            "display": os.environ.get(f"AOM_DISPLAY_{n}", default_display),
+            "slot": os.environ.get(f"AOM_SLOT_{n}", default_slot),
+        }
+    return players
+
+
+PLAYERS = load_players()
+
+
+def player_for(token):
+    """Numero do jogador dono do token, ou None. Compara contra TODOS os tokens, sem
+    sair cedo, para o tempo nao revelar qual jogador quase bateu."""
+    found = None
+    for n, p in PLAYERS.items():
+        if hmac.compare_digest(token.encode(), p["token"].encode()) and found is None:
+            found = n
+    return found
+
+
+# jogador -> websocket ativo: uma sessao por jogador. Reconectar (F5, troca de rede)
+# derruba a sessao antiga, senao duas abas disputariam a mesma tela e o mesmo input.
+ACTIVE = {}
 
 # A pagina chega atras do Cloudflare Access -> NPM -> este servidor. websockets nao
 # valida Host (qualquer Host serve a pagina); o Origin so e checado quando a lista
@@ -529,41 +572,54 @@ async def hide_later(marker, seconds=4.0):
 async def handler(ws):
     info = CONN.get(ws) or {"ip": "?", "token": "", "t0": time.time()}
     loop = asyncio.get_running_loop()
-    disp = Display(DISPLAY_NAME)
-    marker = Marker(disp)
 
     try:
         raw = await ws.recv()
         ev = json.loads(raw)
     except (websockets.exceptions.ConnectionClosed, json.JSONDecodeError):
-        disp.close()
         return
 
     # Segunda camada alem do Cloudflare Access: o hello so aceita um token de sessao
     # valido, vindo do URL (?t=...) ou do campo "token". Comparacao em tempo
     # constante; o valor do token nunca aparece no log.
-    if not AOM_SESSION_TOKEN:
-        print(f"hello negado: AOM_SESSION_TOKEN ausente, ip={info['ip']}", flush=True)
+    if not PLAYERS:
+        print(f"hello negado: nenhum token de jogador configurado, ip={info['ip']}", flush=True)
         await ws.send(json.dumps({"t": "error", "msg": "servidor sem token de sessao"}))
-        disp.close()
         return
-    if not hmac.compare_digest(ev.get("token") or info["token"], AOM_SESSION_TOKEN):
+    n = player_for(ev.get("token") or info["token"] or "")
+    if n is None:
         print(f"hello negado: token invalido, ip={info['ip']}", flush=True)
         await ws.send(json.dumps({"t": "error", "msg": "token de sessao invalido"}))
-        disp.close()
+        return
+    player = PLAYERS[n]
+    display_name = player["display"]
+
+    if ev.get("decoder") != "webrtc":
+        await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
         return
 
-    print(f"entrada: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+    try:
+        disp = Display(display_name)
+    except Exception as e:
+        print(f"hello negado: jogador {n} sem tela {display_name} ({e}), ip={info['ip']}",
+              flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": f"instancia do jogador {n} fora do ar"}))
+        return
+
+    old = ACTIVE.get(n)
+    if old is not None and old is not ws:
+        print(f"jogador {n}: nova conexao substitui a anterior", flush=True)
+        await old.close(4000, "sessao aberta em outro lugar")
+    ACTIVE[n] = ws
+    marker = Marker(disp)
+
+    print(f"entrada: jogador={n} tela={display_name} slot={player['slot']} ip={info['ip']} "
+          f"hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
     pressed = set()          # modificadores atualmente pressionados por este cliente
     stats = {"blocked": 0}   # atalhos de sistema descartados antes de injetar
 
-    if ev.get("decoder") != "webrtc":
-        await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
-        disp.close()
-        return
-
-    container = av.open(f"{DISPLAY_NAME}.0", format="x11grab",
+    container = av.open(f"{display_name}.0", format="x11grab",
                         options={"framerate": str(FPS), "video_size": f"{WIDTH}x{HEIGHT}"})
     stream = container.streams.video[0]
 
@@ -579,7 +635,7 @@ async def handler(ws):
     pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
-    audio_track = AudioTrack(SLOT) if AUDIO else None
+    audio_track = AudioTrack(player["slot"]) if AUDIO else None
     if audio_track:
         pc.addTrack(audio_track)
 
@@ -677,9 +733,11 @@ async def handler(ws):
         marker.close()
         disp.close()
         CONN.pop(ws, None)
+        if ACTIVE.get(n) is ws:
+            ACTIVE.pop(n, None)
         dur = time.time() - info["t0"]
         # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
-        print(f"saida: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
+        print(f"saida: jogador={n} ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
               f"duracao={dur:.0f}s atalhos bloqueados={stats['blocked']}", flush=True)
 
 
@@ -704,7 +762,8 @@ async def process_request(connection, request):
 
 
 async def main():
-    print(f"webrtc (aiortc): porta {PORT}, display {DISPLAY_NAME}, {WIDTH}x{HEIGHT}@{FPS}", flush=True)
+    print(f"webrtc (aiortc): porta {PORT}, {WIDTH}x{HEIGHT}@{FPS}, jogadores: " +
+          ", ".join(f"{n}->{p['display']}/slot{p['slot']}" for n, p in PLAYERS.items()), flush=True)
     # ping de protocolo a cada 20 s + ping JSON do cliente a cada 30 s: um proxy ou o
     # tunel derruba um WebSocket ocioso (o Cloudflare fecha em ~100 s sem trafego).
     async with websockets.serve(handler, "0.0.0.0", PORT, process_request=process_request,
