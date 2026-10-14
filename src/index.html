@@ -6,7 +6,8 @@
 <style>
   body { margin: 0; background: #111; color: #ddd; font: 14px/1.4 system-ui, sans-serif; }
   #wrap { display: flex; gap: 12px; padding: 12px; }
-  canvas, video { background: #000; border: 1px solid #333; width: 1280px; height: 720px; }
+  /* o jogo ja desenha o proprio cursor; o do navegador por cima deixa um rastro */
+  canvas, video { background: #000; border: 1px solid #333; width: 1280px; height: 720px; cursor: none; }
   #stats { font: 12px/1.7 ui-monospace, monospace; color: #8ab; white-space: pre; }
   #hint { color: #777; font-size: 12px; max-width: 320px; }
 </style>
@@ -22,7 +23,7 @@
     <button id="probe">medir latencia (probe)</button>
     <button id="sound">ativar som</button>
     <audio id="som" playsinline></audio>
-    <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página.</div>
+    <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página. O cursor do navegador esta escondido sobre a tela: o jogo desenha o dele, e a camera anda quando esse cursor chega nos extremos.</div>
   </div>
 </div>
 <script>
