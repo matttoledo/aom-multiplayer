@@ -28,6 +28,11 @@
     <button id="probe">medir latencia (probe)</button>
     <button id="sound">ativar som</button>
     <button id="full">tela cheia</button>
+    <button id="invite" style="display:none">copiar convite</button>
+    <div id="convite" style="display:none; font-size:12px; margin:6px 0">
+      <span id="conviteMsg"></span>
+      <input id="conviteUrl" readonly style="display:none; width:300px">
+    </div>
     <label id="volbox">volume <input id="vol" type="range" min="0" max="100" step="1" value="100"> <span id="volpct">100%</span></label>
     <audio id="som" playsinline></audio>
     <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página. O cursor do navegador esta escondido sobre a tela: o jogo desenha o dele, e a camera anda quando esse cursor chega nos extremos.</div>
@@ -509,6 +514,7 @@ function onMessage(e) {
         if (m.audio) audioCodec = m.audio;
         if (m.ice) iceConfig = m.ice;
         if (m.serverStart) serverStart = m.serverStart;
+        document.getElementById('invite').style.display = m.owner ? '' : 'none';
         if (mode === 'mse') initMSE();
         else if (mode === 'webrtc') initWebRTC();
         else decoder = makeDecoder();
@@ -522,6 +528,12 @@ function onMessage(e) {
         const now = performance.now();
         const rtt = now - m.client_ts;
         clockOffset = (m.client_ts + rtt / 2) - m.server_ts * 1000;
+      } else if (m.t === 'invite-ok') {
+        showInvite(m);
+      } else if (m.t === 'invite-err') {
+        conviteBox.style.display = '';
+        conviteMsg.textContent = 'convite: ' + m.msg;
+        conviteUrl.style.display = 'none';
       } else if (m.t === 'probe-at') {
         probe = { drawnServer: m.drawn };
       } else if (m.t === 'error') {
@@ -596,6 +608,29 @@ function pos(e) {
     x: Math.max(0, Math.min(W - 1, Math.round((e.clientX - ox) / k))),
     y: Math.max(0, Math.min(H - 1, Math.round((e.clientY - oy) / k))),
   };
+}
+
+// Convite (so o dono ve o botao): o servidor devolve um token que vence em 48 h e a
+// pagina monta o link. Se o navegador nao deixar copiar, o link aparece num campo.
+const conviteBox = document.getElementById('convite');
+const conviteMsg = document.getElementById('conviteMsg');
+const conviteUrl = document.getElementById('conviteUrl');
+document.getElementById('invite').addEventListener('click', () => send({ t: 'invite' }));
+function showInvite(m) {
+  const url = location.origin + location.pathname + '?mode=webrtc&t=' + encodeURIComponent(m.token);
+  const vence = new Date(m.expires * 1000).toLocaleString('pt-BR',
+    { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+  const texto = 'jogador ' + m.player + ', vale ate ' + vence;
+  conviteBox.style.display = '';
+  conviteUrl.value = url;
+  navigator.clipboard.writeText(url).then(() => {
+    conviteMsg.textContent = 'link copiado (' + texto + ')';
+    conviteUrl.style.display = 'none';
+  }).catch(() => {
+    conviteMsg.textContent = 'copie o link (' + texto + '):';
+    conviteUrl.style.display = '';
+    conviteUrl.select();
+  });
 }
 
 // Tela cheia no proprio video. O Keyboard Lock (Chrome) segura as teclas que o
