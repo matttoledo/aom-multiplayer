@@ -25,10 +25,12 @@ Input: XTest no display :2.
 """
 import asyncio
 import fractions
+import hmac
 import json
 import logging
 import os
 import time
+import urllib.parse
 import urllib.request
 
 import av
@@ -90,6 +92,56 @@ STUN_URL = os.environ.get("STUN_URL", "stun:stun.cloudflare.com:3478")
 CF_TURN_KEY_ID = os.environ.get("CF_TURN_KEY_ID", "")
 CF_TURN_API_TOKEN = os.environ.get("CF_TURN_API_TOKEN", "")
 CF_TURN_TTL = int(os.environ.get("CF_TURN_TTL", "86400"))
+
+# Segredo nunca no chat, no log nem no commit: AOM_SESSION_TOKEN e as variaveis do
+# TURN ficam num .env chmod 600 lido pelo processo.
+ENV_FILE = os.environ.get("AOM_ENV_FILE",
+                          os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+
+def load_env(path):
+    """KEY=VAL de um .env simples, sem dependencia externa. Nunca loga o valor."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if st.st_mode & 0o077:
+        print("AVISO: .env legivel por outros:", oct(st.st_mode & 0o777), flush=True)
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+
+
+load_env(ENV_FILE)
+AOM_SESSION_TOKEN = os.environ.get("AOM_SESSION_TOKEN", "")
+
+# A pagina chega atras do Cloudflare Access -> NPM -> este servidor. websockets nao
+# valida Host (qualquer Host serve a pagina); o Origin so e checado quando a lista
+# existe, e sem Origin (cliente que nao e navegador) continua aceito.
+ALLOWED_ORIGINS = [
+    "https://aom.matheustoledo.dev",
+    "http://192.168.15.17:8081",
+    "http://localhost:8081",
+    "http://127.0.0.1:8081",
+]
+
+# conexao -> {ip, token, t0}: o IP do jogador vem do tunel, nao do socket.
+CONN = {}
+
+
+def client_ip(request, connection):
+    cf = request.headers.get("CF-Connecting-IP", "")
+    if cf:
+        return cf
+    xff = request.headers.get("X-Forwarded-For", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    peer = connection.remote_address
+    return peer[0] if peer else "?"
 
 
 def ice_servers(turn=None):
@@ -497,6 +549,14 @@ HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html
 
 
 async def process_request(connection, request):
+    q = urllib.parse.urlparse(request.path).query
+    CONN[connection] = {
+        "ip": client_ip(request, connection),
+        # o token pode vir no URL (?t=...) ou no campo "token" do hello; o valor nunca
+        # aparece no log
+        "token": urllib.parse.parse_qs(q).get("t", [""])[0],
+        "t0": time.time(),
+    }
     path = request.path.split("?")[0]
     if path == "/" and request.headers.get("Upgrade", "").lower() != "websocket":
         with open(HTML_PATH, "rb") as f:
@@ -507,7 +567,10 @@ async def process_request(connection, request):
 
 async def main():
     print(f"webrtc (aiortc): porta {PORT}, display {DISPLAY_NAME}, {WIDTH}x{HEIGHT}@{FPS}", flush=True)
-    async with websockets.serve(handler, "0.0.0.0", PORT, process_request=process_request):
+    # ping de protocolo a cada 20 s + ping JSON do cliente a cada 30 s: um proxy ou o
+    # tunel derruba um WebSocket ocioso (o Cloudflare fecha em ~100 s sem trafego).
+    async with websockets.serve(handler, "0.0.0.0", PORT, process_request=process_request,
+                                origins=ALLOWED_ORIGINS, ping_interval=20, ping_timeout=20):
         await asyncio.Future()
 
 
