@@ -210,3 +210,54 @@ adicionadas as linhas `keyframes decodificados` e `QP medio`. O "offset de reló
 −1,79 trilhão ms **não está quebrado**: `client_ts` é `performance.now()` (ms desde o load)
 e `server_ts*1000` é epoch ms, então o offset é a origem do relógio por definição — só era
 um número feio. Passou a ser exibido em megamilissegundos com essa explicação.
+
+## 10. Transporte: P2P direto por STUN (14/out)
+
+Caminho decidido: navegador → **Cloudflare Access** (login por e-mail, só convidados) →
+**Tunnel** → **NPM do Orange Pi** (`npm:80`, sem ModSecurity) → `http://192.168.15.17:8081`.
+O **vídeo vai P2P por STUN** entre o navegador do amigo e o asus; a mídia não passa pelo
+túnel nem pelo Pi.
+
+Medido no asus, **um único socket UDP**, mesma porta local para os dois destinos:
+
+| destino | IP:porta mapeado |
+|---|---|
+| `stun.cloudflare.com:3478` | `179.164.111.8:42625` |
+| `stun.l.google.com:19302` | `179.164.111.8:42625` |
+
+IP público, sem CGNAT, mapeamento independente do destino e porta preservada: o melhor caso
+para P2P (Easy NAT / full-cone). Os dois servidores respondem `Binding-Success` com
+`XOR-MAPPED-ADDRESS` no código legado `0x0020` (RFC 3489), não `0x0014` — parser que só
+aceita 5389 não enxerga nada. Firewall local não bloqueia: ufw inativo, nenhuma chain de
+filtro no OUTPUT.
+
+**Forçar `relay` era erro.** O ICE testa todos os pares em paralelo; um candidato de LAN que
+não alcança não atrasa a conexão. Política `ALL` nos dois lados, `iceServers` só com STUN, e
+TURN como reserva desligada (só entra se `CF_TURN_KEY_ID` + `CF_TURN_API_TOKEN` existirem, e
+sempre junto com o STUN).
+
+Teste local (cliente Python no próprio asus, `getStats()`):
+
+```
+connectionState: connected
+PAR NOMINADO: local type=host 192.168.15.17:<porta> | remote type=host 192.168.15.17:<porta>
+inbound-rtp: packetsReceived 2771-2897, packetsLost 0
+candidatos srflx: 4, todos 179.164.111.8 com a MESMA porta local
+```
+
+Bug corrigido no caminho: `RTCPeerConnection(servers)` recebia lista; o aiortc só tolera
+lista quando ela é vazia (`[] or RTCConfiguration()`), então com STUN configurado o
+`addTrack` quebrava. Agora `RTCConfiguration(iceServers=...)`.
+
+Segfault corrigido: o `finally` fechava o container do `x11grab` enquanto o thread do
+executor ainda estava dentro de `next(gen)` — use-after-free confirmado com
+`PYTHONFAULTHANDLER=1` (crash em `concurrent/futures/thread.py:58`). O servidor morria a cada
+cliente; agora sobrevive a sessões sucessivas.
+
+Fora do escopo agora (anotado, não feito): áudio Opus no WebRTC; keyframe a cada 1–2 s e
+4–6 Mbps em vez de 17.
+
+Falta do lado do Matheus: Access self-hosted para `aom.matheustoledo.dev` (criar antes do
+hostname), hostname no túnel → `http://npm:80`, reserva de DHCP no roteador Vivo
+(MAC `7c:10:c9:ac:4d:a7` → `192.168.15.17`), e o `aom.conf` no orange-juice-box (PR aberto
+por ele, deploy manual depois do merge).
