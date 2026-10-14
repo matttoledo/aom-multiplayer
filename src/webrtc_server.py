@@ -38,9 +38,8 @@ from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import MediaStreamTrack
-from aiortc.rtcicetransport import RTCIceCandidate, RTCIceGatherer
+from aiortc.rtcicetransport import RTCIceCandidate
 from aiortc.sdp import candidate_from_sdp
-from aioice.ice import TransportPolicy
 
 import websockets
 from websockets.datastructures import Headers
@@ -70,49 +69,43 @@ MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "20000000"))
 PRESET = os.environ.get("PRESET", "p4")
 PORT = int(os.environ.get("PORT", "8081"))
 
-# TURN: o tunel Cloudflare leva apenas a signalizacao (HTTP/WS), nunca midia. Sem
-# TURN o caminho WebRTC funciona so para cliente que alcanca o asus diretamente
-# (mesma LAN ou malha). Medido no asus: STUN UDP e TCP para Google e Cloudflare
-# todos com timeout, e TCP 3478 tambem - o egress permite TCP 80/443 e nada mais.
+# Arquitetura decidida: pagina + sinalizacao pelo tunel Cloudflare (Access -> NPM ->
+# este servidor); VIDEO P2P direto por STUN entre o navegador do amigo e o asus. A
+# midia nao passa pelo tunel nem pelo Pi.
 #
-# Por isso o TURN da Cloudflare e o unico caminho possivel: ela expoe
-#   turns:turn.cloudflare.com:443?transport=tcp
-# que e TLS na 443, exatamente o egress que o asus tem. aioice suporta turns com
-# TLS (aiortc define turn_ssl=True quando o esquema e "turns"), medido no codigo:
-# aiortc/rtcicetransport.py:133.
+# Medido no asus com UM unico socket UDP, mesma porta local para os dois destinos:
+#   stun.cloudflare.com:3478 -> 179.164.111.8:<porta local>
+#   stun.l.google.com:19302  -> 179.164.111.8:<porta local>
+# IP publico, sem CGNAT, mapeamento independente do destino: o melhor caso para P2P.
+# Detalhe do parser: esses servidores devolvem XOR-MAPPED-ADDRESS no codigo legado
+# 0x0020 (RFC 3489), nao no 0x0014 (RFC 5389).
 #
-# Credenciais: o TURN key e um segredo de longo prazo que fica no servidor; cada
-# conexao gera credenciais de curta duracao (ttl) via API. Nao hardcodear o token:
-# vir de variavel de ambiente.
+# Forcar RELAY era erro: o ICE testa todos os pares em paralelo, e um candidato de
+# LAN que nao alcanca nao atrasa a conexao. Politicas: ALL nos dois lados.
+STUN_URL = os.environ.get("STUN_URL", "stun:stun.cloudflare.com:3478")
+
+# TURN como reserva DESLIGADA: so entra se as duas variaveis existirem no ambiente.
+# Sem elas, nenhuma chamada a API e nenhum erro. Com elas, o TURN vai JUNTO com o
+# STUN, nunca sozinho.
 CF_TURN_KEY_ID = os.environ.get("CF_TURN_KEY_ID", "")
 CF_TURN_API_TOKEN = os.environ.get("CF_TURN_API_TOKEN", "")
 CF_TURN_TTL = int(os.environ.get("CF_TURN_TTL", "86400"))
-RELAY_ONLY = os.environ.get("RELAY_ONLY", "1") == "1"
-
-_ORIG_GATHERER_INIT = RTCIceGatherer.__init__
 
 
-def _gatherer_init(self, iceServers=None, local_username=None, local_password=None):
-    """Forcar politica RELAY no lado do servidor quando ha TURN.
-
-    O aiortc nao expoe transport_policy (aioice/ice.py:446 aceita, mas o aiortc nao
-    passa). Sem isso o ICE tenta primeiro os candidatos host do asus - IPs de LAN que
-    um amigo remoto nunca alcanca - e o relay so entra depois. Com RELAY o gatherer
-    devolve apenas o candidato do TURN, que e o unico caminho possivel.
-    """
-    _ORIG_GATHERER_INIT(self, iceServers, local_username, local_password)
-    if iceServers and RELAY_ONLY:
-        self._connection._transport_policy = TransportPolicy.RELAY
-
-
-RTCIceGatherer.__init__ = _gatherer_init
+def ice_servers(turn=None):
+    """STUN sempre; TURN apenas quando configurado, e sempre junto com o STUN."""
+    servers = [RTCIceServer(urls=[STUN_URL])]
+    if turn:
+        servers.extend(turn)
+    return servers
 
 
 async def turn_credentials():
     """Credenciais de TURN de curta duracao, uma por conexao.
 
-    Retorna [] quando nao ha credenciais configuradas (ai, o caminho WebRTC so
-    funciona para cliente na mesma LAN).
+    Reserva desligada: retorna [] quando as variaveis nao existem, sem chamar a API e
+    sem erro. O STUN continua sendo o caminho; o TURN e apenas um candidato extra,
+    para o caso de NAT simetrico no 4G do amigo.
     """
     if not (CF_TURN_KEY_ID and CF_TURN_API_TOKEN):
         return []
@@ -144,11 +137,18 @@ async def turn_credentials():
 
 def ice_json(servers):
     """Mesma coisa para o navegador: o cliente cria o RTCPeerConnection antes do
-    answer, entao as credenciais vao no hello-ok."""
-    return [
-        {"urls": s.urls, "username": s.username, "credential": s.credential}
-        for s in servers
-    ]
+    answer, entao as credenciais vao no hello-ok.
+
+    A API de credenciais da Cloudflare devolve uma URL com porta 53, que o navegador
+    bloqueia; ela fica no servidor (aioice aceita) e sai do JSON do cliente.
+    """
+    out = []
+    for s in servers:
+        urls = [u for u in (s.urls or []) if ":53" not in u]
+        if not urls:
+            continue
+        out.append({"urls": urls, "username": s.username, "credential": s.credential})
+    return out
 WINDOW_NAME = os.environ.get("WINDOW_NAME", "Age of Mythology").lower()
 
 # ATENCAO: no FFmpeg 7 (PyAV 17) as AVOptions do h264_nvenc NAO incluem
@@ -398,7 +398,7 @@ async def handler(ws):
         except Exception:
             pass
 
-    servers = await turn_credentials()
+    servers = ice_servers(await turn_credentials())
     pc = RTCPeerConnection(servers)
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
