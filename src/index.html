@@ -63,6 +63,11 @@ async function pollStats() {
   try {
     const s = await pc.getStats();
     s.forEach((r) => {
+      if (r.type === 'inbound-rtp' && r.kind === 'audio') {
+        rtcStats.audioPkts = r.packetsReceived;
+        rtcStats.audioLost = r.packetsLost;
+        rtcStats.audioLevel = r.audioLevel;
+      }
       if (r.type === 'inbound-rtp' && r.kind === 'video') {
         rtcStats.recebidos = r.packetsReceived;
         rtcStats.perdidos = r.packetsLost;
@@ -141,6 +146,11 @@ function updateStats() {
     'LATENCIA MEDIDA POR PROBE:      ' + (probeLatency == null ? '-' : probeLatency.toFixed(0) + ' ms') + '\n' +
     'erro decoder:         ' + diag.decodeErr + '\n' +
     'erro mse:             ' + diag.mseErr + '\n' +
+    (mode === 'webrtc'
+      ? 'audio (opus):         ' + (rtcStats.audioPkts == null ? '-' : rtcStats.audioPkts + ' pacotes, ' +
+          rtcStats.audioLost + ' perdidos, nivel ' + (rtcStats.audioLevel || 0).toFixed(3)) +
+        ' | ' + (audio.paused ? 'pausado (clique "ativar som")' : 'tocando') + '\n'
+      : '') +
     'audio:                ' + audioFragments + ' fragmentos' +
       (audioFragments ? ' | ' + (audio.paused ? 'pausado (clique "ativar som")' : 'tocando') : '') +
       (diag.audioErr !== '-' ? ' | ' + diag.audioErr : '') + '\n' +
@@ -289,6 +299,8 @@ async function initWebRTC() {
   video.style.display = 'block';
   pc = new RTCPeerConnection({ iceServers: iceConfig });
   const t = pc.addTransceiver('video', { direction: 'recvonly' });
+  // audio Opus no mesmo transporte P2P do video (no modo webrtc nao ha MSE de audio)
+  pc.addTransceiver('audio', { direction: 'recvonly' });
 
   // Sem isso o Chrome prefere VP8 e o servidor codifica em libvpx por software
   // (~1 Mbps) -> tela pixelizada. Forcar H264 faz o servidor usar NVENC.
@@ -320,7 +332,14 @@ async function initWebRTC() {
   }
 
   pc.ontrack = (ev) => {
-    video.srcObject = ev.streams[0];
+    // o <video> e mudo de proposito; o som vai no <audio>, que o botao "ativar som"
+    // (ou o primeiro clique) libera do bloqueio de autoplay
+    if (ev.track.kind === 'audio') {
+      audio.srcObject = new MediaStream([ev.track]);
+      enableSound();
+      return;
+    }
+    video.srcObject = new MediaStream([ev.track]);
     video.play().catch(() => {});
     video.requestVideoFrameCallback(onRendered);
   };
@@ -386,7 +405,7 @@ ws.onmessage = (e) => {
         if (mode === 'mse') initMSE();
         else if (mode === 'webrtc') initWebRTC();
         else decoder = makeDecoder();
-        if (audioCodec) initAudioMSE();
+        if (audioCodec && mode !== 'webrtc') initAudioMSE();
       } else if (m.t === 'answer') {
         if (m.serverStart) serverStart = m.serverStart;
         if (pc) pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });

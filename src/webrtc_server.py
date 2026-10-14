@@ -40,7 +40,7 @@ import aiortc.rtcrtpsender
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
-from aiortc.mediastreams import MediaStreamTrack
+from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
 from aiortc.rtcicetransport import RTCIceCandidate
 from aiortc.sdp import candidate_from_sdp
 
@@ -71,6 +71,17 @@ BITRATE = int(os.environ.get("BITRATE", "17000000"))
 MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "20000000"))
 PRESET = os.environ.get("PRESET", "p4")
 PORT = int(os.environ.get("PORT", "8081"))
+
+# Audio do slot do jogador (mesmo esquema do server.py): o jogo toca no sink
+# aom_slotN e o monitor dele e capturado. Aqui vai em Opus dentro do WebRTC, nao em
+# AAC/fMP4: o RTP leva o audio no mesmo transporte P2P do video.
+SLOT = os.environ.get("SLOT", "1")
+SLOT_PREFIX = os.environ.get("SLOT_PREFIX", "aom_slot")
+AUDIO = os.environ.get("AUDIO", "1") == "1"
+AUDIO_RATE = 48000
+AUDIO_CHANNELS = 2
+# 20 ms por quadro: o encoder Opus do aiortc espera exatamente 960 amostras a 48 kHz
+AUDIO_SAMPLES = AUDIO_RATE // 50
 
 # Arquitetura decidida: pagina + sinalizacao pelo tunel Cloudflare (Access -> NPM ->
 # este servidor); VIDEO P2P direto por STUN entre o navegador do amigo e o asus. A
@@ -371,6 +382,58 @@ class CaptureTrack(MediaStreamTrack):
         return frame
 
 
+class AudioTrack(MediaStreamTrack):
+    """PCM do monitor do slot -> quadros de 20 ms; o aiortc codifica em Opus.
+
+    PyAV nao tem demuxer pulse, entao o ffmpeg captura e entrega s16le cru no stdout.
+    O ritmo vem da propria captura (tempo real), por isso recv() nao dorme.
+    """
+    kind = "audio"
+
+    def __init__(self, slot):
+        super().__init__()
+        self.slot = slot
+        self.proc = None
+        self.pts = 0
+        self.frames = 0
+
+    async def _start(self):
+        self.proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            "-f", "pulse", "-i", f"{SLOT_PREFIX}{self.slot}.monitor",
+            "-f", "s16le", "-ac", str(AUDIO_CHANNELS), "-ar", str(AUDIO_RATE), "-",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+
+    async def recv(self):
+        if self.proc is None:
+            await self._start()
+        size = AUDIO_SAMPLES * AUDIO_CHANNELS * 2
+        try:
+            data = await self.proc.stdout.readexactly(size)
+        except asyncio.IncompleteReadError:
+            print(f"audio slot {self.slot}: captura terminou", flush=True)
+            self.stop()
+            raise MediaStreamError
+        frame = av.AudioFrame(format="s16", layout="stereo", samples=AUDIO_SAMPLES)
+        frame.planes[0].update(data)
+        frame.sample_rate = AUDIO_RATE
+        frame.pts = self.pts
+        frame.time_base = fractions.Fraction(1, AUDIO_RATE)
+        self.pts += AUDIO_SAMPLES
+        self.frames += 1
+        if self.frames % 1500 == 0:
+            print(f"audio slot {self.slot}: {self.frames} quadros", flush=True)
+        return frame
+
+    def stop(self):
+        super().stop()
+        if self.proc and self.proc.returncode is None:
+            self.proc.terminate()
+
+
 def find_window(disp):
     root = disp.screen().root
 
@@ -516,6 +579,9 @@ async def handler(ws):
     pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
+    audio_track = AudioTrack(SLOT) if AUDIO else None
+    if audio_track:
+        pc.addTrack(audio_track)
 
     @pc.on("icecandidate")
     def on_ice(candidate):
@@ -602,6 +668,8 @@ async def handler(ws):
     finally:
         await pc.close()
         track.stop()
+        if audio_track:
+            audio_track.stop()
         # esperar o decode em andamento: sem isso o thread do executor ainda esta
         # dentro de next(gen) quando o container e liberado -> segfault
         with track.decoding:
