@@ -10,6 +10,8 @@
   canvas, video { background: #000; border: 1px solid #333; width: 1280px; height: 720px; cursor: none; }
   #stats { font: 12px/1.7 ui-monospace, monospace; color: #8ab; white-space: pre; }
   #hint { color: #777; font-size: 12px; max-width: 320px; }
+  #volbox { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 12px; }
+  #vol { width: 160px; }
 </style>
 </head>
 <body>
@@ -22,6 +24,7 @@
     <div id="stats">conectando…</div>
     <button id="probe">medir latencia (probe)</button>
     <button id="sound">ativar som</button>
+    <label id="volbox">volume <input id="vol" type="range" min="0" max="100" step="1" value="100"> <span id="volpct">100%</span></label>
     <audio id="som" playsinline></audio>
     <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página. O cursor do navegador esta escondido sobre a tela: o jogo desenha o dele, e a camera anda quando esse cursor chega nos extremos.</div>
   </div>
@@ -264,6 +267,23 @@ function enableSound() {
   });
 }
 document.getElementById('sound').addEventListener('click', enableSound);
+
+// Volume local do <audio>: nao mexe no som do jogo no asus nem no dos outros
+// jogadores. Fica salvo neste navegador (localStorage pode faltar em aba anonima).
+const vol = document.getElementById('vol');
+const volPct = document.getElementById('volpct');
+function setVolume(v) {
+  audio.volume = v / 100;
+  vol.value = v;
+  volPct.textContent = v + '%';
+}
+let volSalvo = null;
+try { volSalvo = localStorage.getItem('aom-volume'); } catch (e) { /* sem storage */ }
+setVolume(volSalvo != null && !isNaN(+volSalvo) ? +volSalvo : 100);
+vol.addEventListener('input', () => {
+  setVolume(+vol.value);
+  try { localStorage.setItem('aom-volume', vol.value); } catch (e) { /* sem storage */ }
+});
 
 // latencia real: momento em que o frame vai para a tela menos o momento em que foi capturado
 function onRendered(now, meta) {
@@ -587,8 +607,11 @@ document.addEventListener('mousemove', (e) => {
   send({ t: 'move', x: p.x, y: p.y });
 });
 
-document.addEventListener('keydown', (e) => { send({ t: 'key', key: e.key, down: true }); });
-document.addEventListener('keyup', (e) => { send({ t: 'key', key: e.key, down: false }); });
+// teclas com o foco num controle da pagina (a barra de volume) nao vao para o jogo:
+// sem isso as setas mexeriam no volume e na camera ao mesmo tempo
+const noControle = (e) => e.target instanceof HTMLInputElement;
+document.addEventListener('keydown', (e) => { if (!noControle(e)) send({ t: 'key', key: e.key, down: true }); });
+document.addEventListener('keyup', (e) => { if (!noControle(e)) send({ t: 'key', key: e.key, down: false }); });
 
 connect();
 </script>
