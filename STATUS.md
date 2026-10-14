@@ -385,3 +385,24 @@ O VT ativo ficou em tty3 o tempo todo. Decisao: **uma tela por jogador**, todas 
 
 Ainda nao medido: o jogo rodando no `:3` (o teste usou `glxgears`; o jogo tambem e OpenGL, via wined3d),
 input por XTest no `:3`, e captura NVENC das duas telas ao mesmo tempo.
+
+## 2026-10-14 — duas instancias de pe; a sala LAN ainda nao abriu
+
+Medido:
+
+- P1 e P2 rodando ao mesmo tempo pelo `scripts/instance.sh`: P1 em ns1/`:2`/`.wine-aom-p1`, P2 em
+  ns2/`:3`/`.wine-aom-p2`, cada um com o diretorio do jogo em overlay (`/home/matt/aominst/pN/game`)
+  e `UserName=PLAYERN`. As duas telas renderizam o menu (OCR: Single Player, Online, LAN, Editor).
+- Navegacao por OCR (tesseract com a imagem 2x, cinza e invertida) + xdotool: LAN -> "LAN/Direct IP
+  Login" (Nickname, OK em 546,362) -> navegador LAN (Host em 402,203, campo "P1's Game", lista "LAN
+  Games", Join, Refresh, "Type a Direct IP" + Connect).
+- O botao Host nao cria a sala: depois do clique nao abre porta nova no ns1 (so UDP 2296 e uma
+  efemera) e nada entra em `lobby.txt` nem em `steam-callbacks.txt`. Igual com o P1 antigo e com um
+  P1 recem-lancado. Por OCR nao da para ver o que a tela mostra depois do clique.
+- Na `br0` so passam as consultas de descoberta do P1: 10.77.0.1 -> 255.255.255.255:2299, 9 bytes.
+- Ha dois caminhos de multiplayer no jogo: LAN/Direct IP (BSocks, porta 2299) e Online, que usa o
+  lobby do emulador (`LobbyChat::OnLobbyCreated` aconteceu as 15:09 numa sessao anterior, com
+  `lobby.txt` = "Client PLAYER (1) joined").
+
+Proximo: ver a tela do P1 depois do Host (pelo navegador, token do jogador 1) para saber o que bloqueia;
+se o LAN nao abrir, testar o caminho Online do emulador entre ns1 e ns2.
