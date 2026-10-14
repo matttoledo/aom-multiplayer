@@ -424,6 +424,7 @@ async def hide_later(marker, seconds=4.0):
 
 
 async def handler(ws):
+    info = CONN.get(ws) or {"ip": "?", "token": "", "t0": time.time()}
     loop = asyncio.get_running_loop()
     disp = Display(DISPLAY_NAME)
     marker = Marker(disp)
@@ -434,6 +435,22 @@ async def handler(ws):
     except (websockets.exceptions.ConnectionClosed, json.JSONDecodeError):
         disp.close()
         return
+
+    # Segunda camada alem do Cloudflare Access: o hello so aceita um token de sessao
+    # valido, vindo do URL (?t=...) ou do campo "token". Comparacao em tempo
+    # constante; o valor do token nunca aparece no log.
+    if not AOM_SESSION_TOKEN:
+        print(f"hello negado: AOM_SESSION_TOKEN ausente, ip={info['ip']}", flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": "servidor sem token de sessao"}))
+        disp.close()
+        return
+    if not hmac.compare_digest(ev.get("token") or info["token"], AOM_SESSION_TOKEN):
+        print(f"hello negado: token invalido, ip={info['ip']}", flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": "token de sessao invalido"}))
+        disp.close()
+        return
+
+    print(f"entrada: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
 
     if ev.get("decoder") != "webrtc":
         await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
@@ -542,7 +559,11 @@ async def handler(ws):
         container.close()
         marker.close()
         disp.close()
-        print("cliente desconectado", flush=True)
+        CONN.pop(ws, None)
+        dur = time.time() - info["t0"]
+        # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
+        print(f"saida: ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
+              f"duracao={dur:.0f}s", flush=True)
 
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")

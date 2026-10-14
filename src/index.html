@@ -345,7 +345,8 @@ async function initWebRTC() {
 }
 
 /* ---------- protocolo ---------- */
-const forced = new URLSearchParams(location.search).get('mode');
+const params = new URLSearchParams(location.search);
+const forced = params.get('mode');
 // Cloudflare serve a pagina por HTTPS -> o WebSocket precisa ser wss. Em http://
 // (localhost ou LAN) ws:// continua correto.
 const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
@@ -355,7 +356,7 @@ ws.onopen = () => {
   stats.textContent = 'conectado, aguardando hello…';
   const hasWebCodecs = typeof VideoDecoder !== 'undefined';
   const declared = forced || (hasWebCodecs ? 'webcodecs' : 'mse');
-  ws.send(JSON.stringify({ t: 'hello', decoder: declared }));
+  ws.send(JSON.stringify({ t: 'hello', decoder: declared, token: params.get('t') || '' }));
   ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
   // Cloudflare fecha um WebSocket depois de ~100 s sem trafego. O video mantem o
   // canal ocupado, mas um ping a cada 30 s cobre os periodos sem video e mantem o
