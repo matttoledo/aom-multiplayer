@@ -121,8 +121,10 @@ AOM_SESSION_TOKEN = os.environ.get("AOM_SESSION_TOKEN", "")
 
 # A pagina chega atras do Cloudflare Access -> NPM -> este servidor. websockets nao
 # valida Host (qualquer Host serve a pagina); o Origin so e checado quando a lista
-# existe, e sem Origin (cliente que nao e navegador) continua aceito.
+# existe. None na lista aceita cliente sem Origin (curl, script): navegador sempre
+# manda Origin, entao a protecao continua.
 ALLOWED_ORIGINS = [
+    None,
     "https://aom.matheustoledo.dev",
     "http://192.168.15.17:8081",
     "http://localhost:8081",
