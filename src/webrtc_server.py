@@ -173,6 +173,8 @@ def player_for(token):
 
 # jogador -> websocket ativo: uma sessao por jogador. Reconectar (F5, troca de rede)
 # derruba a sessao antiga, senao duas abas disputariam a mesma tela e o mesmo input.
+# Valor: {"ws": websocket da sessao, "end": Event que encerra a sessao}. O Event
+# existe porque a sessao pode seguir sem WebSocket (input pelo DataChannel).
 ACTIVE = {}
 
 # A pagina chega atras do Cloudflare Access -> NPM -> este servidor. websockets nao
@@ -632,10 +634,12 @@ async def handler(ws):
         return
 
     old = ACTIVE.get(n)
-    if old is not None and old is not ws:
+    if old is not None and old["ws"] is not ws:
         print(f"jogador {n}: nova conexao substitui a anterior", flush=True)
-        await old.close(4000, "sessao aberta em outro lugar")
-    ACTIVE[n] = ws
+        old["end"].set()
+        await old["ws"].close(4000, "sessao aberta em outro lugar")
+    session = {"ws": ws, "end": asyncio.Event()}
+    ACTIVE[n] = session
     marker = Marker(disp)
 
     print(f"entrada: jogador={n} tela={display_name} slot={player['slot']} ip={info['ip']} "
@@ -681,6 +685,50 @@ async def handler(ws):
     def on_state():
         print(f"estado: jogador={n} {pc.connectionState} hora={time.strftime('%H:%M:%S')}",
               flush=True)
+        if pc.connectionState in ("failed", "closed"):
+            session["end"].set()
+
+    def on_event(ev, reply):
+        """ping, probe e input: chegam pelo WebSocket ou pelo DataChannel."""
+        t = ev.get("t")
+        if t == "ping":
+            reply({"t": "pong", "client_ts": ev.get("ts"), "server_ts": time.time()})
+        elif t == "probe":
+            drawn = marker.draw()
+            reply({"t": "probe-at", "drawn": drawn})
+            asyncio.create_task(hide_later(marker))
+        elif t not in ("offer", "ice", "hello"):
+            apply_input(disp, ev, pressed, stats)
+
+    # Input pelo DataChannel "input" que a pagina abre: vai P2P junto com o video,
+    # sem passar pelo tunel. A queda de 2026-10-14 17:09:59 foi o WebSocket, e com
+    # ele caia a partida. Ordenado e confiavel: perder um mouseup prende o botao.
+    channels = {}
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        if channel.label != "input":
+            return
+        channels["input"] = channel
+
+        def reply(obj):
+            if channel.readyState == "open":
+                channel.send(json.dumps(obj))
+
+        @channel.on("message")
+        def on_message(msg):
+            if not isinstance(msg, str):
+                return
+            try:
+                on_event(json.loads(msg), reply)
+            except Exception as e:
+                print(f"datachannel jogador {n}: {e!r}", flush=True)
+
+        @channel.on("close")
+        def on_close():
+            # sem DataChannel e sem WebSocket nao ha como jogar: encerra. Com o
+            # WebSocket vivo o input segue por ele e o Event so e lido quando ele cair.
+            session["end"].set()
 
     await ws.send(json.dumps({
         "t": "hello-ok",
@@ -738,39 +786,38 @@ async def handler(ws):
                     await pc.addIceCandidate(c)
                 except Exception as e:
                     print("ice:", e, flush=True)
-            elif t == "ping":
-                await ws.send(json.dumps({
-                    "t": "pong",
-                    "client_ts": ev.get("ts"),
-                    "server_ts": time.time(),
-                }))
-            elif t == "probe":
-                drawn = marker.draw()
-                await ws.send(json.dumps({"t": "probe-at", "drawn": drawn}))
-                asyncio.create_task(hide_later(marker))
             else:
-                apply_input(disp, ev, pressed, stats)
+                on_event(ev, send_json)
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
         log_ws_close(ws, n)
-        await pc.close()
-        track.stop()
-        if audio_track:
-            audio_track.stop()
-        # esperar o decode em andamento: sem isso o thread do executor ainda esta
-        # dentro de next(gen) quando o container e liberado -> segfault
-        with track.decoding:
-            container.close()
-        marker.close()
-        disp.close()
-        CONN.pop(ws, None)
-        if ACTIVE.get(n) is ws:
-            ACTIVE.pop(n, None)
-        dur = time.time() - info["t0"]
-        # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
-        print(f"saida: jogador={n} ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
-              f"duracao={dur:.0f}s atalhos bloqueados={stats['blocked']}", flush=True)
+        try:
+            dc = channels.get("input")
+            if (not session["end"].is_set() and pc.connectionState == "connected"
+                    and dc is not None and dc.readyState == "open"):
+                # o tunel caiu, mas video e input andam P2P: a partida segue ate o
+                # WebRTC cair (consent do ICE), o navegador fechar ou outra aba entrar
+                print(f"jogador {n}: sem WebSocket, sessao segue pelo DataChannel", flush=True)
+                await session["end"].wait()
+        finally:
+            await pc.close()
+            track.stop()
+            if audio_track:
+                audio_track.stop()
+            # esperar o decode em andamento: sem isso o thread do executor ainda esta
+            # dentro de next(gen) quando o container e liberado -> segfault
+            with track.decoding:
+                container.close()
+            marker.close()
+            disp.close()
+            CONN.pop(ws, None)
+            if ACTIVE.get(n) is session:
+                ACTIVE.pop(n, None)
+            dur = time.time() - info["t0"]
+            # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
+            print(f"saida: jogador={n} ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')} "
+                  f"duracao={dur:.0f}s atalhos bloqueados={stats['blocked']}", flush=True)
 
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")

@@ -172,6 +172,7 @@ function updateStats() {
       'decoder:              ' + (rtcStats.decoder ?? '-') + '\n' +
       'limitacao:            ' + (rtcStats.limitacao ?? '-') + '\n' +
       'NACK / PLI:           ' + (rtcStats.nack ?? '-') + ' / ' + (rtcStats.pli ?? '-') + '\n' +
+      'input por:            ' + (diag.input ?? 'websocket') + '\n' +
       'websocket:            ' + (diag.ws ?? '-')
       : '');
 }
@@ -294,6 +295,7 @@ video.addEventListener('timeupdate', keepLive);
 
 /* ---------- WebRTC ---------- */
 let pc = null;
+let inputDc = null;          // DataChannel do input: P2P, nao depende do tunel
 
 async function initWebRTC() {
   canvas.style.display = 'none';
@@ -346,6 +348,13 @@ async function initWebRTC() {
   } catch (e) {
     diag.codecPref = 'setCodecPreferences falhou: ' + e.message;
   }
+
+  // Input (e ping/probe) por DataChannel, P2P junto com o video. Com ele a partida
+  // sobrevive a queda do WebSocket, que passa pelo tunel do Cloudflare.
+  inputDc = pc.createDataChannel('input');   // ordenado e confiavel: mouseup nao se perde
+  inputDc.onmessage = (e) => onMessage({ data: e.data });
+  inputDc.onopen = () => { diag.input = 'datachannel (p2p)'; updateStats(); };
+  inputDc.onclose = () => { if (pc === myPc) { diag.input = 'websocket'; updateStats(); } };
 
   pc.ontrack = (ev) => {
     tentativas = 0;
@@ -400,7 +409,7 @@ const forced = params.get('mode');
 function reconnect(motivo) {
   if (fatal || reconnectTimer) return;
   if (ws && ws.readyState <= 1) { ws.onclose = null; ws.onmessage = null; ws.close(); }
-  if (pc) { pc.close(); pc = null; }
+  if (pc) { pc.close(); pc = null; inputDc = null; }
   clearInterval(pingTimer);
   const espera = Math.min(10000, 1000 * 2 ** tentativas);
   tentativas++;
@@ -430,6 +439,8 @@ function onOpen() {
   // canal ocupado, mas um ping a cada 30 s cobre os periodos sem video e mantem o
   // clockOffset atualizado (o relogio do navegador deriva de performance.now()).
   clearInterval(pingTimer);
+  // o ping fica no WebSocket mesmo com o DataChannel aberto: e o trafego que impede o
+  // Cloudflare de fechar o WebSocket ocioso
   pingTimer = setInterval(() => {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
   }, 30000);
@@ -448,6 +459,14 @@ function onClose(e) {
   // so o modo webrtc sabe se refazer; MSE/WebCodecs continuam como antes
   if (fatal || mode !== 'webrtc') {
     stats.textContent = 'conexao fechada (' + e.code + ')' + (ultimoErro ? ' — ' + ultimoErro : '');
+    return;
+  }
+  // video e input andam P2P: a queda do tunel nao interrompe a partida. Se o WebRTC
+  // cair depois, o onconnectionstatechange reconecta (abrindo outro WebSocket).
+  if (pc && pc.connectionState === 'connected' && inputDc && inputDc.readyState === 'open') {
+    clearInterval(pingTimer);
+    diag.ws = 'caiu (' + e.code + '), partida segue pelo canal P2P';
+    updateStats();
     return;
   }
   reconnect('websocket ' + e.code);
@@ -530,7 +549,8 @@ function onMessage(e) {
 
 /* ---------- input ---------- */
 function send(obj) {
-  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
+  if (inputDc && inputDc.readyState === 'open') inputDc.send(JSON.stringify(obj));
+  else if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
 document.getElementById('probe').addEventListener('click', () => {
