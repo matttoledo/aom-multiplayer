@@ -33,6 +33,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 
 import av
 import aiortc.codecs
@@ -443,6 +444,9 @@ class AudioTrack(MediaStreamTrack):
     async def _start(self):
         self.proc = await asyncio.create_subprocess_exec(
             "ffmpeg", "-hide_banner", "-loglevel", "error",
+            # 3840 bytes = 20 ms de s16 estereo a 48 kHz: sem isso o pulse entrega em
+            # rajadas e o jitter buffer de audio do navegador sobe para ~120 ms
+            "-fragment_size", str(AUDIO_SAMPLES * AUDIO_CHANNELS * 2),
             "-f", "pulse", "-i", f"{SLOT_PREFIX}{self.slot}.monitor",
             "-f", "s16le", "-ac", str(AUDIO_CHANNELS), "-ar", str(AUDIO_RATE), "-",
             stdin=asyncio.subprocess.DEVNULL,
@@ -637,7 +641,12 @@ async def handler(ws):
     pc.addTrack(track)
     audio_track = AudioTrack(player["slot"]) if AUDIO else None
     if audio_track:
-        pc.addTrack(audio_track)
+        audio_sender = pc.addTrack(audio_track)
+        # O aiortc da o mesmo stream id (a=msid) a todas as faixas, e o Chrome entao
+        # sincroniza o video com o audio: o video passa a esperar o buffer do audio.
+        # Medido: jitterBufferDelay do video 119-135 ms com o msid comum, 3-4 ms com
+        # msid proprio para o audio. Num RTS o cursor importa mais que o lip sync.
+        audio_sender._stream_id = str(uuid.uuid4())
 
     @pc.on("icecandidate")
     def on_ice(candidate):

@@ -48,6 +48,8 @@ async def main():
             break
     ans = d["sdp"]
     print("answer com m=audio:", "m=audio" in ans, "| opus:", "opus/48000" in ans.lower())
+    msids = {l.split()[0] for l in ans.splitlines() if l.startswith("a=msid:")}
+    print("streams distintos no answer (a=msid):", len(msids))
     await pc.setRemoteDescription(RTCSessionDescription(ans, "answer"))
 
     track = await asyncio.wait_for(got, timeout=20)
