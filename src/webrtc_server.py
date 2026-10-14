@@ -551,6 +551,20 @@ def dom_keysym(key):
     return sym
 
 
+def focus_game(disp, win):
+    """Foco de teclado na janela do jogo. Sem gerenciador de janelas ninguem faz isso:
+    com o foco em PointerRoot o X entrega a tecla a janela do jogo, mas o Wine nao a
+    considera ativa e descarta o teclado (mouse segue funcionando). Aconteceu em
+    2026-10-14; xdotool windowfocus resolveu na hora."""
+    if win is None:
+        return
+    try:
+        win.set_input_focus(X.RevertToParent, X.CurrentTime)
+        disp.sync()
+    except Exception as e:
+        print("foco:", e, flush=True)
+
+
 def blocked_key(key, pressed):
     if key in BLOCKED_KEYS:
         return True
@@ -561,7 +575,7 @@ def blocked_key(key, pressed):
     return False
 
 
-def apply_input(disp, ev, pressed, stats):
+def apply_input(disp, ev, pressed, stats, game_win=None):
     t = ev.get("t")
     if t == "key":
         key = ev.get("key", "")
@@ -589,6 +603,9 @@ def apply_input(disp, ev, pressed, stats):
         else:
             button = int(ev.get("button", 1))
             down = bool(ev.get("down", True))
+            if down:
+                # clique = o jogador quer o jogo em foco, como num desktop normal
+                focus_game(disp, game_win)
             xtest.fake_input(disp, X.ButtonPress if down else X.ButtonRelease, button, x=x, y=y)
     disp.sync()
 
@@ -664,6 +681,8 @@ async def handler(ws):
     session = {"ws": ws, "end": asyncio.Event()}
     ACTIVE[n] = session
     marker = Marker(disp)
+    game_win = find_window(disp)
+    focus_game(disp, game_win)
 
     print(f"entrada: jogador={n} tela={display_name} slot={player['slot']} ip={info['ip']} "
           f"hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
@@ -721,7 +740,7 @@ async def handler(ws):
             reply({"t": "probe-at", "drawn": drawn})
             asyncio.create_task(hide_later(marker))
         elif t not in ("offer", "ice", "hello"):
-            apply_input(disp, ev, pressed, stats)
+            apply_input(disp, ev, pressed, stats, game_win)
 
     # Input pelo DataChannel "input" que a pagina abre: vai P2P junto com o video,
     # sem passar pelo tunel. A queda de 2026-10-14 17:09:59 foi o WebSocket, e com
