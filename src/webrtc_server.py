@@ -669,12 +669,17 @@ def focus_game(disp, win):
     considera ativa e descarta o teclado (mouse segue funcionando). Aconteceu em
     2026-10-14; xdotool windowfocus resolveu na hora."""
     if win is None:
-        return
+        return False
     try:
+        # get_geometry e ida e volta: levanta BadWindow se a janela morreu. O
+        # set_input_focus sozinho nao levanta (o erro do X chega depois, so impresso)
+        win.get_geometry()
         win.set_input_focus(X.RevertToParent, X.CurrentTime)
         disp.sync()
+        return True
     except Exception as e:
         print("foco:", e, flush=True)
+        return False
 
 
 def blocked_key(key, pressed):
@@ -718,9 +723,11 @@ def apply_input(disp, ev, pressed, stats, game=None):
             if down and game is not None:
                 # clique = o jogador quer o jogo em foco, como num desktop normal. A
                 # janela pode nao existir ainda se a instancia acabou de subir.
-                if game["win"] is None:
+                # a janela pode nao existir ainda (instancia recem-subida) ou ter
+                # morrido (jogo reiniciado no meio da sessao, 2026-10-14): procura de novo
+                if game["win"] is None or not focus_game(disp, game["win"]):
                     game["win"] = find_window(disp)
-                focus_game(disp, game["win"])
+                    focus_game(disp, game["win"])
             xtest.fake_input(disp, X.ButtonPress if down else X.ButtonRelease, button, x=x, y=y)
     disp.sync()
 
