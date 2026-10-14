@@ -568,6 +568,27 @@ def apply_input(disp, ev, pressed, stats):
     disp.sync()
 
 
+def log_ws_close(ws, n):
+    """Quem fechou o WebSocket e por que. Sem isto uma queda no meio da partida nao
+    deixava rastro: o handler engolia o ConnectionClosed (2026-10-14, 17:09:59).
+
+    cliente  = o navegador mandou close (refresh, aba fechada, 4000 de outra aba)
+    servidor = este lado fechou (1011 = o ping de 20 s ficou sem resposta)
+    nenhum   = a conexao TCP sumiu sem close (1006): tunel, NPM ou rede no caminho
+    """
+    proto = getattr(ws, "protocol", None)
+    rcvd = getattr(proto, "close_rcvd", None)
+    sent = getattr(proto, "close_sent", None)
+    if rcvd is not None and (sent is None or getattr(proto, "close_rcvd_then_sent", False)):
+        quem = "cliente"
+    elif sent is not None:
+        quem = "servidor"
+    else:
+        quem = "nenhum"
+    print(f"ws fechou: jogador={n} code={ws.close_code} motivo={ws.close_reason!r} "
+          f"iniciado_por={quem} hora={time.strftime('%H:%M:%S')}", flush=True)
+
+
 async def hide_later(marker, seconds=4.0):
     await asyncio.sleep(seconds)
     marker.hide()
@@ -658,7 +679,8 @@ async def handler(ws):
 
     @pc.on("connectionstatechange")
     def on_state():
-        print("estado:", pc.connectionState, flush=True)
+        print(f"estado: jogador={n} {pc.connectionState} hora={time.strftime('%H:%M:%S')}",
+              flush=True)
 
     await ws.send(json.dumps({
         "t": "hello-ok",
@@ -731,6 +753,7 @@ async def handler(ws):
     except websockets.exceptions.ConnectionClosed:
         pass
     finally:
+        log_ws_close(ws, n)
         await pc.close()
         track.stop()
         if audio_track:
