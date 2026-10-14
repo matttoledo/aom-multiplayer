@@ -338,3 +338,29 @@ Decisao: **1280x720 por instancia** (uma tela por jogador), nao tiles num virtua
 O input de mouse continua ativo. O que mudou e o cliente: `cursor: none` na area do jogo, porque o jogo
 desenha o proprio cursor e o do navegador deixava um rastro por cima. A camera anda quando o cursor do
 jogo chega nos extremos, e agora os extremos visiveis na pagina sao os extremos reais do jogo.
+
+## 2026-10-14 — o que o multiplayer exige e o que a GPU não deixa
+
+Medido com duas instâncias rodando ao mesmo tempo:
+
+- **Duas instâncias coexistem** com prefixos separados (pid 14288 e 26408). Confirma que o guard
+  de instancia unica e **por prefixo**: cada jogador precisa do seu WINEPREFIX.
+- **Input por instancia exige display por instancia.** XTest e global por display: nao ha como
+  rotear ponteiro/teclado para uma janela especifica num display unico (o foco era `0`, nenhum
+  window, quando havia duas janelas no mesmo display).
+- **Um segundo Xorg na mesma GPU sobe** (`:3`, 1280x720, direct rendering Yes nos dois), mas
+  **a NVIDIA serve um Xorg por vez**: com o `:3` vivo, a captura do `:2` era preta (mean 0 no
+  `import`, mean 18 estatico no `x11grab`, sem resposta a input); depois de derrubar o `:3` e
+  reiniciar o `:2` sozinho, o jogo voltou a renderizar (frame com 247603 cores unicos).
+  Entao "uma tela por jogador" funciona para input, mas **nao para renderizacao** na mesma GPU.
+- **Rede por jogador esta pronta**: `ns1` (10.77.0.1) e `ns2` (10.77.0.2) na `br0`, ping entre
+  eles com 0% de perda e 0.09 ms. O jogo se identifica pelo sockaddr, entao netns separados dao
+  identidades distintas — que e o que o multiplayer BSocks precisa.
+
+Caminhos para input por instancia num display unico (decisao em aberto):
+1. **XI2 / dispositivos virtuais**: criar um master pointer/keyboard por jogador; os eventos vao
+   para a janela sob o ponteiro daquele dispositivo. E a unica forma de rotear input num Xorg so.
+2. **Uma GPU por Xorg** (ou renderizacao por software, que e CPU-bound e inviavel para 6 jogadores).
+
+O que nao mudou: captura por display continua sendo o caminho certo quando o display e de uma
+instancia so; com tiles num display unico, a captura por janela (`xwd -id`) funciona mas o input nao.
