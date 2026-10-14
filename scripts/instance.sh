@@ -24,8 +24,10 @@ if [ ! -d "$PREFIX" ]; then
 fi
 
 mkdir -p "$INST/upper" "$INST/work" "$INST/game"
-chown -R $U:$U "$INST"
 if ! mountpoint -q "$INST/game"; then
+  # NUNCA chown -R aqui: com o overlay montado ele desce no jogo e o copy-up duplica
+  # os 2.8 GB no upper (aconteceu em 2026-10-14: 1.2 GB antes de parar)
+  chown $U:$U "$INST" "$INST/upper" "$INST/work" "$INST/game"
   mount -t overlay overlay -o "lowerdir=$GAME,upperdir=$INST/upper,workdir=$INST/work" "$INST/game"
 fi
 # identidade da instancia: escrever no merged faz copy-up so deste arquivo
