@@ -364,3 +364,24 @@ Caminhos para input por instancia num display unico (decisao em aberto):
 
 O que nao mudou: captura por display continua sendo o caminho certo quando o display e de uma
 instancia so; com tiles num display unico, a captura por janela (`xwd -id`) funciona mas o input nao.
+
+## 2026-10-14 — `-sharevts`: duas telas renderizando na mesma GPU
+
+A causa do "um Xorg por vez" era o VT, nao a NVIDIA. O `:2` esta no VT3, que e o VT ativo
+(`/sys/class/tty/tty0/active` = tty3). Um Xorg novo sem VT explicito pega outro VT e ativa o dele,
+e o Xorg de um VT inativo para de renderizar.
+
+Medido com `scripts/sharevts_test.sh` (`:3` com `vt3 -sharevts -novtswitch`, `glxgears` nas duas telas,
+dois quadros com 0.5 s de intervalo por tela):
+
+| momento | `:2` | `:3` |
+|---|---|---|
+| antes do `:3` | 231701 cores, quadros diferentes | — |
+| `:3` vivo | 261053 cores, quadros diferentes | GTX 1650, direct rendering Yes, quadros diferentes |
+| depois de derrubar o `:3` | 254866 cores, quadros diferentes | — |
+
+O VT ativo ficou em tty3 o tempo todo. Decisao: **uma tela por jogador**, todas no VT3 com
+`-sharevts -novtswitch`. Isso elimina os caminhos XI2 e "uma GPU por Xorg" da secao anterior.
+
+Ainda nao medido: o jogo rodando no `:3` (o teste usou `glxgears`; o jogo tambem e OpenGL, via wined3d),
+input por XTest no `:3`, e captura NVENC das duas telas ao mesmo tempo.
