@@ -36,6 +36,29 @@ navegador  ──WebSocket (signalização)──►  webrtc_server.py
   overlayfs. Custo por jogador: o prefixo (~581 MB), não os 2.8 GB do jogo.
 - Jogo roda como `matt` mesmo dentro do netns: `ip netns exec nsN su matt -c '...'`.
 
+## Caminho de acesso e transporte
+
+- Página e sinalização: navegador → Cloudflare Access (login por e-mail, só convidados) →
+  Cloudflare Tunnel → NPM do Orange Pi (`npm:80`, sem ModSecurity) → `http://192.168.15.17:8081`.
+- **Vídeo P2P direto por STUN** entre o navegador do amigo e o asus: a mídia não passa pelo
+  túnel nem pelo Pi.
+- Medido no asus com um único socket UDP, mesma porta local para os dois destinos:
+  `stun.cloudflare.com:3478` e `stun.l.google.com:19302` → `179.164.111.8:<porta local>`.
+  IP público, sem CGNAT, mapeamento independente do destino: o melhor caso para P2P.
+  Detalhe do parser: esses servidores devolvem `XOR-MAPPED-ADDRESS` no código legado `0x0020`
+  (RFC 3489), não no `0x0014` (RFC 5389).
+- Forçar `relay` era erro: o ICE testa todos os pares em paralelo, e um candidato de LAN que
+  não alcança não atrasa a conexão. Política `ALL` nos dois lados.
+- TURN (Cloudflare Realtime) é reserva **desligada**: só entra se `CF_TURN_KEY_ID` e
+  `CF_TURN_API_TOKEN` existirem no ambiente, e sempre junto com o STUN, nunca sozinho.
+- Segredos (`AOM_SESSION_TOKEN`, variáveis do TURN) ficam num `.env` chmod 600 lido pelo
+  processo — nunca no log, no chat ou no commit. O hello é aceito só com esse token
+  (`hmac.compare_digest`), vindo do URL `?t=...` ou do campo `token`.
+- Input remoto: atalhos de sistema são descartados no servidor antes de injetar
+  (Super/Win, Alt+Tab, Alt+F4, Ctrl+Alt+Del, Ctrl+Esc, Alt+F2). Log por conexão: IP do
+  cliente (de `CF-Connecting-IP`, depois `X-Forwarded-For`, por último o peer), entrada,
+  saída e duração — nunca o conteúdo digitado.
+
 ## Áudio por jogador
 
 - Wine usa `winepulse.drv`, que conecta ao PipeWire. O stream de uma instância **só existe

@@ -29,6 +29,7 @@ import hmac
 import json
 import logging
 import os
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -345,10 +346,18 @@ class CaptureTrack(MediaStreamTrack):
         self.notify = notify
         self.start = None
         self.frames = 0
+        # O decode roda num thread do executor. Fechar o container enquanto o thread
+        # esta dentro de next(gen) e use-after-free: segfault medido com faulthandler
+        # (crash em concurrent/futures/thread.py:58, dentro do decode do PyAV).
+        self.decoding = threading.Lock()
+
+    def _decode(self):
+        with self.decoding:
+            return next(self.gen)
 
     async def recv(self):
         try:
-            frame = await self.loop.run_in_executor(None, next, self.gen)
+            frame = await self.loop.run_in_executor(None, self._decode)
         except StopIteration:
             return None
         if self.start is None:
@@ -592,7 +601,11 @@ async def handler(ws):
         pass
     finally:
         await pc.close()
-        container.close()
+        track.stop()
+        # esperar o decode em andamento: sem isso o thread do executor ainda esta
+        # dentro de next(gen) quando o container e liberado -> segfault
+        with track.decoding:
+            container.close()
         marker.close()
         disp.close()
         CONN.pop(ws, None)
