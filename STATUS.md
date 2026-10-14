@@ -270,3 +270,52 @@ Medido no WAF vivo em 2026-10-14 (paranoia 2, bloqueando, ANOMALY_INBOUND=5): `G
 regra do CRS casou. Depois do `101` os frames do WebSocket não são inspecionados, então o SDP
 não passa pelo CRS. O `proxy_read_timeout` do WAF é 36000 s, e o keepalive de 20 s do servidor
 renova o timeout em qualquer hop.
+
+## 2026-10-14 — o caminho externo medido de verdade
+
+O PR #33 foi mergeado (15:44Z) e o `game.conf` esta deployado: `GET /` devolve a pagina do app,
+nao o "Default Site" do NPM. O WAF continua no caminho: `?x=;cat /etc/passwd` → 403 e `?x=ok` →
+200 na mesma rota.
+
+O upgrade de WebSocket pelo tunel funciona: com HTTP/1.1 o `curl` recebe `101 Switching Protocols`.
+Com HTTP/2 o upgrade nao acontece e o tunel entrega `200 text/html` — isso nao e erro do servidor,
+e o comportamento do HTTP/2, que nao faz upgrade de WebSocket. O handshake completo pelo tunel
+passou: `hello` → `hello-ok` com `iceServers = stun:stun.cloudflare.com:3478`, offer/answer, ICE
+`connected`. O IP do visitante chegou ao servidor pelo `CF-Connecting-IP` (o log de conexao
+registrou o IPv6 do cliente).
+
+O Access ainda NAO esta aplicado na rota: `GET /` responde 200 sem credenciais e nenhum header
+`cf-access-*` aparece. Isso e passo do Matheus.
+
+Teste: `scripts/tunnelclient.py`, que roda no asus (unica maquina com `websockets` + `aiortc`).
+Como cliente e servidor sao a mesma maquina, o par nomeado e `host -> host` em `192.168.15.17`:
+isso prova o caminho de sinalizacao, nao o P2P pela internet. O P2P externo precisa de um cliente
+numa rede de fora (4G). Leitura do par no aiortc: `pc._RTCPeerConnection__iceTransports` →
+`_connection._check_list`; os atributos do par sao `local_candidate`/`remote_candidate` (nao
+`local`/`remote`) e nao ha RTT no aioice.
+
+## 2026-10-14 — audio por slot: o roteamento esta provado, o jogo e que nao produz stream
+
+Com um stream sintetico (`scripts/audio_slot_test.sh`): o monitor de `aom_slot1` mediu
+mean -24.1 dB / max -21.1 dB e o monitor do slot vizinho mediu -91.0 dB. O link
+`stream -> sink` por jogador isola o audio de verdade; `audio_route.py` funciona.
+
+O que falta e o jogo abrir o dispositivo de audio. Medido:
+
+- o driver de audio do Wine e por PREFIXO: `.wine-aom-2` usa `winepulse.drv` (enumera
+  `aom_slot1..8` no registry); `.wine-aom-3` caiu em `winealsa.drv` e o plugin i386
+  `libasound_module_pcm_pipewire.so` nao existe, entao o ALSA vai para `plughw` e nao para o
+  PipeWire;
+- o driver e carregado (`winepulse.drv` aparece no `maps` do processo), mas o Wine so conecta e
+  cria o sink-input quando o jogo TOCA um som. No menu o jogo nao toca nada: `pw-dump` mostra
+  apenas WirePlumber e o `pw-dump`, sem nenhum `Stream`, e o processo nao tem o fd
+  `memfd:pulseaudio` que a conexao cria;
+- a instancia antiga (pid 10832) tinha o `memfd:pulseaudio` porque tinha tocado som numa partida,
+  mas ela nasceu as 20:05 e o daemon PipeWire atual as 20:36 — a conexao do Wine ficou orfa e o
+  Wine nao reconecta. Toda instancia anterior a 20:36 esta sem audio;
+- o input por XTest funciona (a tela mudou depois do clique), mas o menu do jogo nao respondeu ao
+  clique sintetico; o som aparece quando o jogo entra num estado que toca audio.
+
+Guarda de instancia unica CONFIRMADA por prefixo: uma segunda instancia em `.wine-aom-2` enquanto
+a primeira rodava recebeu a janela "Only a single copy of the game can run at once!" (lida por OCR).
+Duas instancias no MESMO prefixo conviveram antes (pids 10832 e 31309) — isso nao esta explicado.
