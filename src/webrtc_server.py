@@ -324,7 +324,12 @@ class NvencH264Encoder(H264Encoder):
             self.codec.width = frame.width
             self.codec.height = frame.height
             self.codec.bit_rate = self.target_bitrate
-            self.codec.pix_fmt = "yuv420p"
+            # O x11grab entrega bgr0, que o NVENC aceita direto e converte na GPU. Com
+            # "yuv420p" aqui o PyAV convertia cada quadro na CPU (swscale) antes do
+            # encode. Medido no asus, 720p sintetico: encode 6.1 -> 2.6 ms (mediana),
+            # 8.6 -> 4.6 ms (p95). Cor no Chrome: pixel a pixel igual nos dois caminhos.
+            rgb_in = frame.format.name in ("bgr0", "rgb0", "bgra", "rgba")
+            self.codec.pix_fmt = frame.format.name if rgb_in else "yuv420p"
             self.codec.framerate = fractions.Fraction(FPS, 1)
             self.codec.time_base = fractions.Fraction(1, FPS)
             # campos do AVCodecContext, NAO AVOptions (ver comentario acima)
