@@ -528,6 +528,29 @@ BLOCKED_COMBOS = {("alt", "Tab"), ("alt", "F4"), ("alt", "F2"),
                   ("ctrl+alt", "Delete"), ("ctrl+alt", "Escape")}
 
 
+# O cliente manda e.key (nome do DOM); o XTest precisa do keysym do X. Os nomes
+# batem para letras, digitos, F1-F12, Tab, Escape, Home, End, Insert e Delete, mas
+# nao para estes: sem a traducao, string_to_keysym devolvia 0 e a tecla sumia
+# (Backspace, Enter, espaco, setas, Shift/Ctrl/Alt e toda a pontuacao, 2026-10-14).
+DOM_KEYSYMS = {
+    "Backspace": "BackSpace", "Enter": "Return", " ": "space",
+    "ArrowLeft": "Left", "ArrowRight": "Right", "ArrowUp": "Up", "ArrowDown": "Down",
+    "Shift": "Shift_L", "Control": "Control_L", "Alt": "Alt_L",
+    "AltGraph": "ISO_Level3_Shift", "Meta": "Super_L",
+    "CapsLock": "Caps_Lock", "NumLock": "Num_Lock", "ScrollLock": "Scroll_Lock",
+    "PageUp": "Prior", "PageDown": "Next", "ContextMenu": "Menu", "PrintScreen": "Print",
+}
+
+
+def dom_keysym(key):
+    sym = string_to_keysym(DOM_KEYSYMS.get(key, key))
+    # caractere unico (pontuacao, acentos): no X o keysym de Latin-1 e o proprio
+    # codigo do caractere ("!" -> 0x21, "ç" -> 0xe7)
+    if not sym and len(key) == 1 and (0x20 <= ord(key) <= 0x7e or 0xa0 <= ord(key) <= 0xff):
+        sym = ord(key)
+    return sym
+
+
 def blocked_key(key, pressed):
     if key in BLOCKED_KEYS:
         return True
@@ -551,7 +574,7 @@ def apply_input(disp, ev, pressed, stats):
         if blocked_key(key, pressed):
             stats["blocked"] += 1
             return
-        sym = string_to_keysym(key)
+        sym = dom_keysym(key)
         if not sym:
             return
         code = disp.keysym_to_keycode(sym)
