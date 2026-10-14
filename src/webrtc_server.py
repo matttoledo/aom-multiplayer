@@ -37,7 +37,7 @@ import av
 import aiortc.codecs
 import aiortc.rtcrtpsender
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.rtcconfiguration import RTCIceServer
+from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
 from aiortc.mediastreams import MediaStreamTrack
 from aiortc.rtcicetransport import RTCIceCandidate
@@ -500,7 +500,9 @@ async def handler(ws):
             pass
 
     servers = ice_servers(await turn_credentials())
-    pc = RTCPeerConnection(servers)
+    # aiortc espera RTCConfiguration; uma lista funciona por acaso so quando esta
+    # vazia ([] or RTCConfiguration()). Com STUN a lista nao e mais vazia -> crash.
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
     track = CaptureTrack(container, stream, loop, send_json)
     pc.addTrack(track)
 
