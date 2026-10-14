@@ -35,5 +35,9 @@ chown $U:$U "$INST/upper/steam_emu.ini"
 ip netns exec "$NS" ip -4 route | grep -q '^default' || ip netns exec "$NS" ip route add default dev "veth$N"
 
 LOG="/tmp/aom-p$N.log"
-ip netns exec "$NS" su $U -c "cd '$INST/game'; DISPLAY=$DISP WINEPREFIX='$PREFIX' WINEDEBUG=-all setsid nohup wine AoMX.exe > $LOG 2>&1 < /dev/null &"
+# su nao passa XDG_RUNTIME_DIR: sem ele o libpulse nao acha o socket, o Wine cai no
+# winealsa e o som nunca chega ao aom_slotN (medido 2026-10-14). PULSE_SINK aponta o
+# stream do jogo direto para o slot do jogador.
+RUN="/run/user/$(id -u $U)"
+ip netns exec "$NS" su $U -c "cd '$INST/game'; XDG_RUNTIME_DIR=$RUN PULSE_SERVER=unix:$RUN/pulse/native PULSE_SINK=aom_slot$N DISPLAY=$DISP WINEPREFIX='$PREFIX' WINEDEBUG=-all setsid nohup wine AoMX.exe > $LOG 2>&1 < /dev/null &"
 echo "jogador $N: $NS, tela $DISP, prefixo $PREFIX, jogo $INST/game, log $LOG"
