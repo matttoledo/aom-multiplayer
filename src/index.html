@@ -345,6 +345,7 @@ async function initWebRTC() {
 }
 
 /* ---------- protocolo ---------- */
+let ultimoErro = null;
 const params = new URLSearchParams(location.search);
 const forced = params.get('mode');
 // Cloudflare serve a pagina por HTTPS -> o WebSocket precisa ser wss. Em http://
@@ -363,7 +364,10 @@ ws.onopen = () => {
   // clockOffset atualizado (o relogio do navegador deriva de performance.now()).
   setInterval(() => ws.send(JSON.stringify({ t: 'ping', ts: performance.now() })), 30000);
 };
-ws.onclose = () => { stats.textContent = 'conexao fechada'; };
+// O motivo do fechamento vem no `error` do servidor, mas o close vinha depois e
+// sobrescrevia. Sem isto o jogador ve so "conexao fechada" e nao sabe que faltou o
+// ?t=<token> na URL.
+ws.onclose = () => { stats.textContent = 'conexao fechada' + (ultimoErro ? ' — ' + ultimoErro : ''); };
 
 ws.onmessage = (e) => {
   const d = e.data;
@@ -394,6 +398,7 @@ ws.onmessage = (e) => {
       } else if (m.t === 'probe-at') {
         probe = { drawnServer: m.drawn };
       } else if (m.t === 'error') {
+        ultimoErro = m.msg;
         stats.textContent = 'erro: ' + m.msg;
         return;
       }
