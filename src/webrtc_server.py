@@ -26,6 +26,7 @@ Input: XTest no display :2.
 import asyncio
 import fractions
 import base64
+import subprocess
 import hashlib
 import hmac
 import json
@@ -140,6 +141,14 @@ INVITE_KEY = os.environ.get("AOM_INVITE_KEY", "")
 INVITE_TTL = int(os.environ.get("AOM_INVITE_TTL", str(48 * 3600)))
 OWNER = 1
 MAX_PLAYERS = 8   # teto do NVENC: 8 sessoes simultaneas
+# Teto de jogadores para convite. Medido (2026-10-14): cada instancia ~1.2 nucleo e
+# 0.8-1.5 GB de RAM; o asus tem 8 nucleos e ~7 GB livres com dois jogos.
+INVITE_MAX = min(MAX_PLAYERS, int(os.environ.get("AOM_MAX_PLAYERS", "5")))
+# Sobe rede, tela e jogo do jogador N (root, via sudo sem senha restrito a este
+# arquivo; scripts/spawn.sh). Sem a regra do sudoers o servidor so convida para
+# instancias que ja estao no ar.
+SPAWN = os.environ.get("AOM_SPAWN", "/usr/local/lib/aom/spawn.sh")
+INVITE_HOLD = 600   # s que um convite segura a vaga ate o amigo entrar
 
 
 def load_players():
@@ -213,12 +222,48 @@ def display_alive(name):
         return False
 
 
+def can_spawn():
+    try:
+        return subprocess.run(["sudo", "-n", "-l", SPAWN], capture_output=True,
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+CAN_SPAWN = can_spawn()
+SPAWNING = {}   # jogador -> task do spawn em andamento
+RESERVED = {}   # jogador -> ate quando o convite segura a vaga (epoch)
+
+
+def spawn_instance(n):
+    """Dispara o spawn.sh do jogador N em segundo plano (uma vez por vez)."""
+    if not CAN_SPAWN or (n in SPAWNING and not SPAWNING[n].done()):
+        return
+
+    async def run():
+        t0 = time.time()
+        proc = await asyncio.create_subprocess_exec(
+            "sudo", "-n", SPAWN, str(n),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+        out, _ = await proc.communicate()
+        tail = out.decode(errors="replace").strip().splitlines()[-1:] or [""]
+        print(f"spawn jogador {n}: rc={proc.returncode} em {time.time() - t0:.0f}s "
+              f"({tail[0]})", flush=True)
+
+    print(f"spawn jogador {n}: subindo rede, tela {PLAYERS[n]['display']} e jogo", flush=True)
+    SPAWNING[n] = asyncio.create_task(run())
+
+
 def invite_slot():
-    """Vaga para o convite: o primeiro jogador (alem do dono) com o jogo no ar e sem
-    sessao; se todos estiverem ocupados, o primeiro no ar (reenvio do link)."""
-    alive = [n for n in sorted(PLAYERS) if n != OWNER and display_alive(PLAYERS[n]["display"])]
-    free = [n for n in alive if n not in ACTIVE]
-    return (free or alive or [None])[0]
+    """Vaga para o convite: o primeiro jogador (alem do dono) sem sessao e sem convite
+    pendente, ate INVITE_MAX. Sem permissao de spawn, so entre os que estao no ar."""
+    now = time.time()
+    for n in sorted(PLAYERS):
+        if n == OWNER or n > INVITE_MAX or n in ACTIVE or RESERVED.get(n, 0) > now:
+            continue
+        if CAN_SPAWN or display_alive(PLAYERS[n]["display"]):
+            return n
+    return None
 
 
 def player_for(token):
@@ -642,7 +687,7 @@ def blocked_key(key, pressed):
     return False
 
 
-def apply_input(disp, ev, pressed, stats, game_win=None):
+def apply_input(disp, ev, pressed, stats, game=None):
     t = ev.get("t")
     if t == "key":
         key = ev.get("key", "")
@@ -670,9 +715,12 @@ def apply_input(disp, ev, pressed, stats, game_win=None):
         else:
             button = int(ev.get("button", 1))
             down = bool(ev.get("down", True))
-            if down:
-                # clique = o jogador quer o jogo em foco, como num desktop normal
-                focus_game(disp, game_win)
+            if down and game is not None:
+                # clique = o jogador quer o jogo em foco, como num desktop normal. A
+                # janela pode nao existir ainda se a instancia acabou de subir.
+                if game["win"] is None:
+                    game["win"] = find_window(disp)
+                focus_game(disp, game["win"])
             xtest.fake_input(disp, X.ButtonPress if down else X.ButtonRelease, button, x=x, y=y)
     disp.sync()
 
@@ -732,9 +780,16 @@ async def handler(ws):
         await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
         return
 
+    RESERVED.pop(n, None)   # o convidado chegou: a vaga e dele
     try:
         disp = Display(display_name)
     except Exception as e:
+        if CAN_SPAWN:
+            # a pagina espera e tenta de novo; a instancia sobe em ~30 s
+            spawn_instance(n)
+            await ws.send(json.dumps({"t": "error", "retry": True,
+                                      "msg": f"preparando o jogo do jogador {n}…"}))
+            return
         print(f"hello negado: jogador {n} sem tela {display_name} ({e}), ip={info['ip']}",
               flush=True)
         await ws.send(json.dumps({"t": "error", "msg": f"instancia do jogador {n} fora do ar"}))
@@ -748,8 +803,8 @@ async def handler(ws):
     session = {"ws": ws, "end": asyncio.Event()}
     ACTIVE[n] = session
     marker = Marker(disp)
-    game_win = find_window(disp)
-    focus_game(disp, game_win)
+    game = {"win": find_window(disp)}
+    focus_game(disp, game["win"])
 
     print(f"entrada: jogador={n} tela={display_name} slot={player['slot']} ip={info['ip']} "
           f"hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
@@ -814,14 +869,18 @@ async def handler(ws):
                 return
             m = invite_slot()
             if m is None:
-                reply({"t": "invite-err", "msg": "nenhuma instancia de jogador no ar"})
+                reply({"t": "invite-err", "msg": f"todas as vagas ocupadas (teto {INVITE_MAX})"})
                 return
+            RESERVED[m] = time.time() + INVITE_HOLD
+            # ja comeca a subir o jogo: quando o amigo abrir o link, esta pronto
+            if not display_alive(PLAYERS[m]["display"]):
+                spawn_instance(m)
             tok, exp = make_invite(m)
             print(f"convite: jogador {n} convidou jogador {m}, vence "
                   f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}", flush=True)
             reply({"t": "invite-ok", "token": tok, "player": m, "expires": exp})
         elif t not in ("offer", "ice", "hello"):
-            apply_input(disp, ev, pressed, stats, game_win)
+            apply_input(disp, ev, pressed, stats, game)
 
     # Input pelo DataChannel "input" que a pagina abre: vai P2P junto com o video,
     # sem passar pelo tunel. A queda de 2026-10-14 17:09:59 foi o WebSocket, e com
@@ -969,6 +1028,8 @@ async def process_request(connection, request):
 async def main():
     print(f"webrtc (aiortc): porta {PORT}, {WIDTH}x{HEIGHT}@{FPS}, jogadores: " +
           ", ".join(f"{n}->{p['display']}/slot{p['slot']}" for n, p in PLAYERS.items()), flush=True)
+    print(f"convites: {'on' if INVITE_KEY else 'off'}, teto {INVITE_MAX} jogadores, "
+          f"spawn {'liberado' if CAN_SPAWN else 'sem permissao'} ({SPAWN})", flush=True)
     # ping de protocolo a cada 20 s + ping JSON do cliente a cada 30 s: um proxy ou o
     # tunel derruba um WebSocket ocioso (o Cloudflare fecha em ~100 s sem trafego).
     async with websockets.serve(handler, "0.0.0.0", PORT, process_request=process_request,
