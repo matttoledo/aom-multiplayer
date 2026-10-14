@@ -58,8 +58,8 @@ let rtcStats = {};
 
 /* Estatisticas reais do recebedor WebRTC: o que o navegador realmente recebeu e
    quanto tempo o jitter buffer dele segurou cada frame. */
-async function pollStats() {
-  if (!pc) return;
+async function pollStats(myPc) {
+  if (!pc || pc !== myPc) return;
   try {
     const s = await pc.getStats();
     s.forEach((r) => {
@@ -101,7 +101,7 @@ async function pollStats() {
     });
     updateStats();
   } catch (e) { /* ignore */ }
-  setTimeout(pollStats, 2000);
+  setTimeout(() => pollStats(myPc), 2000);
 }
 
 /* ---------- probe de latencia real ----------
@@ -171,7 +171,8 @@ function updateStats() {
       'jitter buffer:        ' + (rtcStats.jitter == null ? '-' : rtcStats.jitter.toFixed(0) + ' ms') + '\n' +
       'decoder:              ' + (rtcStats.decoder ?? '-') + '\n' +
       'limitacao:            ' + (rtcStats.limitacao ?? '-') + '\n' +
-      'NACK / PLI:           ' + (rtcStats.nack ?? '-') + ' / ' + (rtcStats.pli ?? '-')
+      'NACK / PLI:           ' + (rtcStats.nack ?? '-') + ' / ' + (rtcStats.pli ?? '-') + '\n' +
+      'websocket:            ' + (diag.ws ?? '-')
       : '');
 }
 
@@ -298,6 +299,21 @@ async function initWebRTC() {
   canvas.style.display = 'none';
   video.style.display = 'block';
   pc = new RTCPeerConnection({ iceServers: iceConfig });
+  const myPc = pc;
+  // ICE morto (rede do jogador trocou, NAT expirou): refaz a sessao inteira.
+  // "disconnected" pode voltar sozinho; so reconecta se durar mais de 5 s.
+  let discTimer = null;
+  pc.onconnectionstatechange = () => {
+    if (pc !== myPc) return;
+    const st = myPc.connectionState;
+    clearTimeout(discTimer);
+    if (st === 'failed') reconnect('webrtc failed');
+    else if (st === 'disconnected') {
+      discTimer = setTimeout(() => {
+        if (pc === myPc && myPc.connectionState !== 'connected') reconnect('webrtc disconnected');
+      }, 5000);
+    }
+  };
   const t = pc.addTransceiver('video', { direction: 'recvonly' });
   // audio Opus no mesmo transporte P2P do video (no modo webrtc nao ha MSE de audio)
   pc.addTransceiver('audio', { direction: 'recvonly' });
@@ -332,6 +348,7 @@ async function initWebRTC() {
   }
 
   pc.ontrack = (ev) => {
+    tentativas = 0;
     // o <video> e mudo de proposito; o som vai no <audio>, que o botao "ativar som"
     // (ou o primeiro clique) libera do bloqueio de autoplay
     if (ev.track.kind === 'audio') {
@@ -361,19 +378,49 @@ async function initWebRTC() {
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);   // gathering comeca aqui
   setTimeout(sendOffer, 3000);           // fallback, nao fica travado
-  pollStats();
+  rtcStats = {};
+  pollStats(myPc);
 }
 
 /* ---------- protocolo ---------- */
 let ultimoErro = null;
+let fatal = false;           // erro que reconectar nao resolve: token, modo, outra aba
+let tentativas = 0;
+let reconnectTimer = null;
+let pingTimer = null;
+let ws = null;
 const params = new URLSearchParams(location.search);
 const forced = params.get('mode');
-// Cloudflare serve a pagina por HTTPS -> o WebSocket precisa ser wss. Em http://
-// (localhost ou LAN) ws:// continua correto.
-const ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
-ws.binaryType = 'arraybuffer';
 
-ws.onopen = () => {
+/* Reconexao automatica. A queda de 2026-10-14 (17:09:59, 38 min de partida) foi o
+   WebSocket: o caminho navegador -> Cloudflare -> tunel -> asus caiu, o servidor
+   derrubou a sessao e so o F5 trazia o jogo de volta. O jogo roda no asus e nao
+   sabe da queda: basta abrir outra sessao. Espera 1, 2, 4... ate 10 s entre
+   tentativas; o contador zera quando o video volta. */
+function reconnect(motivo) {
+  if (fatal || reconnectTimer) return;
+  if (ws && ws.readyState <= 1) { ws.onclose = null; ws.onmessage = null; ws.close(); }
+  if (pc) { pc.close(); pc = null; }
+  clearInterval(pingTimer);
+  const espera = Math.min(10000, 1000 * 2 ** tentativas);
+  tentativas++;
+  stats.textContent = 'conexao caiu (' + motivo + '), reconectando em ' + (espera / 1000) + ' s…';
+  reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, espera);
+}
+
+function connect() {
+  // Cloudflare serve a pagina por HTTPS -> o WebSocket precisa ser wss. Em http://
+  // (localhost ou LAN) ws:// continua correto.
+  ws = new WebSocket((location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host);
+  ws.binaryType = 'arraybuffer';
+  diag.ws = 'conectando';
+  ws.onopen = onOpen;
+  ws.onclose = onClose;
+  ws.onmessage = onMessage;
+}
+
+function onOpen() {
+  diag.ws = 'aberto';
   stats.textContent = 'conectado, aguardando hello…';
   const hasWebCodecs = typeof VideoDecoder !== 'undefined';
   const declared = forced || (hasWebCodecs ? 'webcodecs' : 'mse');
@@ -382,14 +429,31 @@ ws.onopen = () => {
   // Cloudflare fecha um WebSocket depois de ~100 s sem trafego. O video mantem o
   // canal ocupado, mas um ping a cada 30 s cobre os periodos sem video e mantem o
   // clockOffset atualizado (o relogio do navegador deriva de performance.now()).
-  setInterval(() => ws.send(JSON.stringify({ t: 'ping', ts: performance.now() })), 30000);
-};
+  clearInterval(pingTimer);
+  pingTimer = setInterval(() => {
+    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
+  }, 30000);
+}
+
 // O motivo do fechamento vem no `error` do servidor, mas o close vinha depois e
 // sobrescrevia. Sem isto o jogador ve so "conexao fechada" e nao sabe que faltou o
 // ?t=<token> na URL.
-ws.onclose = () => { stats.textContent = 'conexao fechada' + (ultimoErro ? ' — ' + ultimoErro : ''); };
+function onClose(e) {
+  // 4000 = esta sessao foi aberta em outra aba/dispositivo: reconectar aqui
+  // derrubaria a outra, e as duas ficariam se derrubando
+  if (e.code === 4000) { fatal = true; ultimoErro = e.reason || 'sessao aberta em outro lugar'; }
+  // o motivo vai na linha "websocket:" do painel: o texto solto seria sobrescrito
+  // pelo proximo updateStats enquanto o pc ainda existe
+  diag.ws = 'fechado (' + e.code + ')' + (ultimoErro ? ' — ' + ultimoErro : '');
+  // so o modo webrtc sabe se refazer; MSE/WebCodecs continuam como antes
+  if (fatal || mode !== 'webrtc') {
+    stats.textContent = 'conexao fechada (' + e.code + ')' + (ultimoErro ? ' — ' + ultimoErro : '');
+    return;
+  }
+  reconnect('websocket ' + e.code);
+}
 
-ws.onmessage = (e) => {
+function onMessage(e) {
   const d = e.data;
   if (typeof d === 'string') {
     diag.texto++;
@@ -418,6 +482,7 @@ ws.onmessage = (e) => {
       } else if (m.t === 'probe-at') {
         probe = { drawnServer: m.drawn };
       } else if (m.t === 'error') {
+        fatal = true;
         ultimoErro = m.msg;
         stats.textContent = 'erro: ' + m.msg;
         return;
@@ -461,11 +526,11 @@ ws.onmessage = (e) => {
     diag.decodeErr = err.message;
   }
   updateStats();
-};
+}
 
 /* ---------- input ---------- */
 function send(obj) {
-  if (ws.readyState === 1) ws.send(JSON.stringify(obj));
+  if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
 document.getElementById('probe').addEventListener('click', () => {
@@ -504,6 +569,8 @@ document.addEventListener('mousemove', (e) => {
 
 document.addEventListener('keydown', (e) => { send({ t: 'key', key: e.key, down: true }); });
 document.addEventListener('keyup', (e) => { send({ t: 'key', key: e.key, down: false }); });
+
+connect();
 </script>
 </body>
 </html>
