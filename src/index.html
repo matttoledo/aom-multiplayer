@@ -39,7 +39,9 @@
      O video escala para caber mantendo 16:9; pos() desconta as faixas pretas. */
   canvas, video { width: 100%; height: 100%; object-fit: contain; background: #000;
                   cursor: none; display: block; }
-  video:fullscreen, canvas:fullscreen { width: 100vw; height: 100vh; }
+  /* tela cheia e do palco (a pagina do jogo), nao do <video>: o Chrome nao entra
+     no modo de player de video e os nossos controles seguem valendo */
+  #stage:fullscreen { width: 100vw; height: 100vh; }
   #details { position: absolute; top: 12px; right: 12px; width: 300px; max-width: calc(100% - 24px);
              background: rgba(22,26,32,.94); border: 1px solid var(--line); border-radius: 8px;
              padding: 10px 12px; z-index: 2; }
@@ -716,12 +718,13 @@ document.getElementById('toggleDetails').addEventListener('click', (e) => {
   updateStats();
 });
 
-// Tela cheia no proprio video. O Keyboard Lock (Chrome) segura as teclas que o
-// navegador tomaria para si, como Esc: assim o Esc vai para o jogo, e para sair
-// da tela cheia e preciso segurar Esc.
+// Tela cheia no palco, nao no <video>: em tela cheia de video o Chrome se comporta
+// como player (overlay de midia, atalhos de video). O Keyboard Lock (Chrome) segura
+// as teclas que o navegador tomaria para si, como Esc: o Esc vai para o jogo, e
+// para sair da tela cheia e preciso segurar Esc.
 document.getElementById('full').addEventListener('click', async () => {
   try {
-    await target().requestFullscreen();
+    await document.getElementById('stage').requestFullscreen({ navigationUI: 'hide' });
     if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock();
   } catch (e) { diag.fullErr = e.message; }
 });
