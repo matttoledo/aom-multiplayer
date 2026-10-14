@@ -406,3 +406,24 @@ Medido:
 
 Proximo: ver a tela do P1 depois do Host (pelo navegador, token do jogador 1) para saber o que bloqueia;
 se o LAN nao abrir, testar o caminho Online do emulador entre ns1 e ns2.
+
+## 2026-10-14 15:25 — primeira sessao multiplayer: P2 entrou na sala do P1
+
+O Host foi criado pelo navegador (jogador 1, via tunel). O botao responde a um clique de verdade; por
+xdotool+OCR nao abriu a sala (secao anterior), causa nao isolada.
+
+Medido:
+
+- P1 com a sala aberta: UDP 2299 no ns1, `LobbyChat::OnLobbyCreated` as 15:24:45.
+- P2 (ns2, `:3`): LAN -> nickname -> OK -> Refresh mostrou "P1's Game" na lista -> Join. A tela do P2
+  passou para a configuracao da partida (Team, God, Game Type, Map Size). O P2 abriu UDP 2300 e TCP
+  2300 em 10.77.0.2.
+- Na `br0` (`/tmp/lobby.pcap`): descoberta 10.77.0.2 -> broadcast:2299 com resposta 10.77.0.1:2299 ->
+  10.77.0.2; sessao **10.77.0.1:2300 <-> 10.77.0.2:2300 nos dois sentidos** (216 e 166 pacotes). E a
+  primeira vez que a 2300 aparece.
+- `lobby.txt`: P1 registra "PLAYER1 (1)" e "PLAYER1 (2)"; P2 registra "PLAYER2 (1)" e "PLAYER2 (2)".
+  Cada lado escreve o proprio nome para os dois clientes. Nao esta claro se e so o log ou um nome
+  trocado na lista de jogadores — conferir na tela de configuracao.
+
+Conclusao: o caminho LAN/BSocks com um netns por jogador funciona para descoberta e entrada na sala.
+Falta: iniciar a partida e jogar alguns minutos sem dessincronizar; audio por slot do P2.
