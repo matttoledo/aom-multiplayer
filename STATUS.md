@@ -319,3 +319,22 @@ O que falta e o jogo abrir o dispositivo de audio. Medido:
 Guarda de instancia unica CONFIRMADA por prefixo: uma segunda instancia em `.wine-aom-2` enquanto
 a primeira rodava recebeu a janela "Only a single copy of the game can run at once!" (lida por OCR).
 Duas instancias no MESMO prefixo conviveram antes (pids 10832 e 31309) — isso nao esta explicado.
+
+## 2026-10-14 — tela delimitada e o clamp do ponteiro resolvido
+
+O frame mostrava 1/4 do jogo porque o display `:2` estava em **2560x1440** (residual do experimento
+do clamp) e o `x11grab` captura `WIDTH x HEIGHT` (1280x720) a partir de `0,0`: o canto superior
+esquerdo de um jogo que renderizava em 2560x1440.
+
+Medido hoje: `xrandr --fb 1280x720` no display `:2` e a instancia reiniciada — a janela do jogo ficou
+exatamente `1280x720+0+0`, entao o frame capturado e o jogo inteiro. Com o virtual igual ao frame,
+`xdotool mousemove 1279 719` confirma que o ponteiro chega aos 4 cantos: o clamp so existia quando o
+virtual era maior que o output ativo. O jogo precisa ser reiniciado depois de mudar o tamanho da tela,
+porque a resolucao e escolhida na inicializacao.
+
+Decisao: **1280x720 por instancia** (uma tela por jogador), nao tiles num virtual grande. O
+`xorg-nvidia.conf` ja tem `Virtual 1280 720` + Modeline `1280x720`; o 2560x1440 era runtime.
+
+O input de mouse continua ativo. O que mudou e o cliente: `cursor: none` na area do jogo, porque o jogo
+desenha o proprio cursor e o do navegador deixava um rastro por cima. A camera anda quando o cursor do
+jogo chega nos extremos, e agora os extremos visiveis na pagina sao os extremos reais do jogo.
