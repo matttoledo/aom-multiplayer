@@ -25,6 +25,8 @@ Input: XTest no display :2.
 """
 import asyncio
 import fractions
+import base64
+import hashlib
 import hmac
 import json
 import logging
@@ -131,6 +133,12 @@ def load_env(path):
 
 load_env(ENV_FILE)
 AOM_SESSION_TOKEN = os.environ.get("AOM_SESSION_TOKEN", "")
+# Convites: o jogador 1 (dono) gera um link para outra vaga que vence em 48 h. O
+# token e "inv.<jogador>.<vence epoch>.<hmac>", assinado com AOM_INVITE_KEY (no
+# .env): nada fica guardado no servidor. Trocar a chave revoga todos os convites.
+INVITE_KEY = os.environ.get("AOM_INVITE_KEY", "")
+INVITE_TTL = int(os.environ.get("AOM_INVITE_TTL", str(48 * 3600)))
+OWNER = 1
 MAX_PLAYERS = 8   # teto do NVENC: 8 sessoes simultaneas
 
 
@@ -146,7 +154,8 @@ def load_players():
         tok = os.environ.get(f"AOM_TOKEN_{n}", "")
         if n == 1 and not tok:
             tok = AOM_SESSION_TOKEN
-        if not tok:
+        # jogador sem token fixo continua existindo: entra por convite (inv.*)
+        if not tok and not (INVITE_KEY and n > 1):
             continue
         default_display = DISPLAY_NAME if n == 1 else f":{n + 1}"
         default_slot = SLOT if n == 1 else str(n)
@@ -161,11 +170,64 @@ def load_players():
 PLAYERS = load_players()
 
 
+def invite_sig(n, exp):
+    mac = hmac.new(INVITE_KEY.encode(), f"inv.{n}.{exp}".encode(), hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(mac).decode().rstrip("=")
+
+
+def make_invite(n):
+    exp = int(time.time()) + INVITE_TTL
+    return f"inv.{n}.{exp}.{invite_sig(n, exp)}", exp
+
+
+def check_invite(token):
+    """(jogador, None) se o convite vale; (None, motivo) se nao."""
+    if not INVITE_KEY:
+        return None, "token de sessao invalido"
+    parts = token.split(".")
+    if len(parts) != 4 or not parts[1].isdigit() or not parts[2].isdigit():
+        return None, "token de sessao invalido"
+    n, exp = int(parts[1]), int(parts[2])
+    if not hmac.compare_digest(parts[3].encode(), invite_sig(n, exp).encode()):
+        return None, "token de sessao invalido"
+    if n == OWNER or n not in PLAYERS:
+        return None, "token de sessao invalido"
+    if time.time() > exp:
+        return None, "convite expirado: peca um novo link"
+    return n, None
+
+
+def resolve_token(token):
+    """Jogador do token (fixo do .env ou convite). (n, None) ou (None, motivo)."""
+    if token.startswith("inv."):
+        return check_invite(token)
+    n = player_for(token)
+    return (n, None) if n is not None else (None, "token de sessao invalido")
+
+
+def display_alive(name):
+    try:
+        Display(name).close()
+        return True
+    except Exception:
+        return False
+
+
+def invite_slot():
+    """Vaga para o convite: o primeiro jogador (alem do dono) com o jogo no ar e sem
+    sessao; se todos estiverem ocupados, o primeiro no ar (reenvio do link)."""
+    alive = [n for n in sorted(PLAYERS) if n != OWNER and display_alive(PLAYERS[n]["display"])]
+    free = [n for n in alive if n not in ACTIVE]
+    return (free or alive or [None])[0]
+
+
 def player_for(token):
     """Numero do jogador dono do token, ou None. Compara contra TODOS os tokens, sem
     sair cedo, para o tempo nao revelar qual jogador quase bateu."""
     found = None
     for n, p in PLAYERS.items():
+        if not p["token"]:
+            continue
         if hmac.compare_digest(token.encode(), p["token"].encode()) and found is None:
             found = n
     return found
@@ -658,10 +720,10 @@ async def handler(ws):
         print(f"hello negado: nenhum token de jogador configurado, ip={info['ip']}", flush=True)
         await ws.send(json.dumps({"t": "error", "msg": "servidor sem token de sessao"}))
         return
-    n = player_for(ev.get("token") or info["token"] or "")
+    n, motivo = resolve_token(ev.get("token") or info["token"] or "")
     if n is None:
-        print(f"hello negado: token invalido, ip={info['ip']}", flush=True)
-        await ws.send(json.dumps({"t": "error", "msg": "token de sessao invalido"}))
+        print(f"hello negado: {motivo}, ip={info['ip']}", flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": motivo}))
         return
     player = PLAYERS[n]
     display_name = player["display"]
@@ -744,6 +806,20 @@ async def handler(ws):
             drawn = marker.draw()
             reply({"t": "probe-at", "drawn": drawn})
             asyncio.create_task(hide_later(marker))
+        elif t == "invite":
+            # so o dono convida; o link (com o token) vai so para a pagina dele, nunca
+            # para o log
+            if n != OWNER or not INVITE_KEY:
+                reply({"t": "invite-err", "msg": "convite indisponivel"})
+                return
+            m = invite_slot()
+            if m is None:
+                reply({"t": "invite-err", "msg": "nenhuma instancia de jogador no ar"})
+                return
+            tok, exp = make_invite(m)
+            print(f"convite: jogador {n} convidou jogador {m}, vence "
+                  f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}", flush=True)
+            reply({"t": "invite-ok", "token": tok, "player": m, "expires": exp})
         elif t not in ("offer", "ice", "hello"):
             apply_input(disp, ev, pressed, stats, game_win)
 
@@ -784,6 +860,9 @@ async def handler(ws):
         # com TURN configurado, forcar relay: sem isso o navegador tenta primeiro o
         # candidato host, que nunca funciona para um cliente remoto
         "relay": bool(servers),
+        # o dono ve o botao de convite
+        "owner": n == OWNER and bool(INVITE_KEY),
+        "player": n,
     }))
 
     try:
