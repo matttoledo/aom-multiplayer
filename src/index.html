@@ -12,6 +12,9 @@
   #hint { color: #777; font-size: 12px; max-width: 320px; }
   #volbox { display: flex; align-items: center; gap: 8px; margin: 8px 0; font-size: 12px; }
   #vol { width: 160px; }
+  /* tela cheia: o video ocupa a tela toda mantendo 16:9 (faixas pretas se a tela
+     tiver outra proporcao); pos() desconta as faixas */
+  video:fullscreen, canvas:fullscreen { width: 100vw; height: 100vh; border: 0; object-fit: contain; }
 </style>
 </head>
 <body>
@@ -24,6 +27,7 @@
     <div id="stats">conectando…</div>
     <button id="probe">medir latencia (probe)</button>
     <button id="sound">ativar som</button>
+    <button id="full">tela cheia</button>
     <label id="volbox">volume <input id="vol" type="range" min="0" max="100" step="1" value="100"> <span id="volpct">100%</span></label>
     <audio id="som" playsinline></audio>
     <div id="hint">Clique na tela para enviar input. Teclado funciona com o foco nesta página. O cursor do navegador esta escondido sobre a tela: o jogo desenha o dele, e a camera anda quando esse cursor chega nos extremos.</div>
@@ -579,10 +583,35 @@ document.getElementById('probe').addEventListener('click', () => {
   send({ t: 'probe' });
 });
 
+// Coordenada na tela do jogo (1280x720). Fora da tela cheia o elemento tem
+// exatamente esse tamanho; em tela cheia ele escala e pode ter faixas pretas. O
+// clamp manda o ponteiro na faixa para a borda do jogo, onde a camera anda.
 function pos(e) {
   const r = target().getBoundingClientRect();
-  return { x: Math.round(e.clientX - r.left), y: Math.round(e.clientY - r.top) };
+  const W = 1280, H = 720;
+  const k = Math.min(r.width / W, r.height / H);
+  const ox = r.left + (r.width - W * k) / 2;
+  const oy = r.top + (r.height - H * k) / 2;
+  return {
+    x: Math.max(0, Math.min(W - 1, Math.round((e.clientX - ox) / k))),
+    y: Math.max(0, Math.min(H - 1, Math.round((e.clientY - oy) / k))),
+  };
 }
+
+// Tela cheia no proprio video. O Keyboard Lock (Chrome) segura as teclas que o
+// navegador tomaria para si, como Esc: assim o Esc vai para o jogo, e para sair
+// da tela cheia e preciso segurar Esc.
+document.getElementById('full').addEventListener('click', async () => {
+  try {
+    await target().requestFullscreen();
+    if (navigator.keyboard && navigator.keyboard.lock) await navigator.keyboard.lock();
+  } catch (e) { diag.fullErr = e.message; }
+});
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement && navigator.keyboard && navigator.keyboard.unlock) {
+    navigator.keyboard.unlock();
+  }
+});
 
 function target() { return mode === 'webcodecs' ? canvas : video; }
 
