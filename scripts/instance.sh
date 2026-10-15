@@ -22,6 +22,26 @@ NS="ns$N"
 # e 300-430 mil trocas de contexto/s com dois jogos, medido 2026-10-14)
 WINE="${WINE:-/opt/wine-stable/bin/wine}"
 [ -x "$WINE" ] || WINE=wine
+# CPU do jogo (medido 2026-10-14, instancia 3, menu a 30 fps):
+#   wined3d (D3D11 -> OpenGL)          129% | thread principal 99%
+#   DXVK (D3D11 -> Vulkan)             108% | 99%
+#   DXVK + yieldsleep 50 us             22% | 13%, ainda 30 quadros/s na tela
+# O laco de espera e do proprio jogo (sched_yield + getrusage, ~110 mil/s cada);
+# yieldsleep (scripts/yieldsleep.c) faz o yield dormir. So yieldsleep, sem DXVK,
+# derrubava o fps (a thread principal esperava a wined3d_cs).
+# AOM_YIELD_US=0 desliga o yieldsleep; AOM_DXVK=0 volta ao wined3d.
+D="$(dirname "$(readlink -f "$0")")"
+AOM_YIELD_US="${AOM_YIELD_US:-50}"
+PRELOAD=""
+if [ "$AOM_YIELD_US" != 0 ] && [ -f "$D/yieldsleep32.so" ]; then
+  PRELOAD="AOM_YIELD_US=$AOM_YIELD_US LD_PRELOAD=$D/yieldsleep32.so"
+fi
+OVERRIDES="mscoree,mshtml="
+DXVK=""
+if [ "${AOM_DXVK:-1}" != 0 ] && [ -f "$D/dxvk/x32/d3d11.dll" ]; then
+  DXVK=1
+  OVERRIDES="$OVERRIDES;d3d11,dxgi,d3d10core=n,b"
+fi
 # Na primeira execucao num prefixo do 9.0 o Wine 11 atualiza o prefixo e abre o
 # instalador do Wine Mono, que trava a subida ate alguem clicar. O jogo nao usa .NET
 # nem o motor HTML: mscoree/mshtml desligados pulam o Mono e o Gecko.
@@ -44,10 +64,20 @@ chown $U:$U "$INST/upper/steam_emu.ini"
 
 ip netns exec "$NS" ip -4 route | grep -q '^default' || ip netns exec "$NS" ip route add default dev "veth$N"
 
+if [ -n "$DXVK" ]; then
+  # DLLs de 32 bits do DXVK no diretorio de sistema de 32 bits do prefixo
+  # (syswow64 num prefixo de 64 bits, system32 num de 32, como os p1-p3)
+  SYS="$PREFIX/drive_c/windows/syswow64"
+  [ -d "$SYS" ] || SYS="$PREFIX/drive_c/windows/system32"
+  for f in d3d11 dxgi d3d10core; do
+    cmp -s "$D/dxvk/x32/$f.dll" "$SYS/$f.dll" || install -o $U -g $U -m 644 "$D/dxvk/x32/$f.dll" "$SYS/$f.dll"
+  done
+fi
+
 LOG="/tmp/aom-p$N.log"
 # su nao passa XDG_RUNTIME_DIR: sem ele o libpulse nao acha o socket, o Wine cai no
 # winealsa e o som nunca chega ao aom_slotN (medido 2026-10-14). PULSE_SINK aponta o
 # stream do jogo direto para o slot do jogador.
 RUN="/run/user/$(id -u $U)"
-ip netns exec "$NS" su $U -c "cd '$INST/game'; XDG_RUNTIME_DIR=$RUN PULSE_SERVER=unix:$RUN/pulse/native PULSE_SINK=aom_slot$N DISPLAY=$DISP WINEPREFIX='$PREFIX' WINEDEBUG=-all WINEDLLOVERRIDES=mscoree,mshtml= setsid nohup $WINE AoMX.exe > $LOG 2>&1 < /dev/null &"
-echo "jogador $N: $NS, tela $DISP, prefixo $PREFIX, jogo $INST/game, wine $($WINE --version), log $LOG"
+ip netns exec "$NS" su $U -c "cd '$INST/game'; XDG_RUNTIME_DIR=$RUN PULSE_SERVER=unix:$RUN/pulse/native PULSE_SINK=aom_slot$N DISPLAY=$DISP WINEPREFIX='$PREFIX' WINEDEBUG=-all WINEDLLOVERRIDES='$OVERRIDES' $PRELOAD setsid nohup $WINE AoMX.exe > $LOG 2>&1 < /dev/null &"
+echo "jogador $N: $NS, tela $DISP, prefixo $PREFIX, jogo $INST/game, wine $($WINE --version)${PRELOAD:+, yield ${AOM_YIELD_US}us}, dlls $OVERRIDES, log $LOG"
