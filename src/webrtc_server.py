@@ -788,6 +788,9 @@ async def handler(ws):
         return
 
     RESERVED.pop(n, None)   # o convidado chegou: a vaga e dele
+    if n != OWNER:
+        # garante o jogo, nao so a tela (spawn.sh nao mexe no que ja esta no ar)
+        spawn_instance(n)
     try:
         disp = Display(display_name)
     except Exception as e:
@@ -879,9 +882,10 @@ async def handler(ws):
                 reply({"t": "invite-err", "msg": f"todas as vagas ocupadas (teto {INVITE_MAX})"})
                 return
             RESERVED[m] = time.time() + INVITE_HOLD
-            # ja comeca a subir o jogo: quando o amigo abrir o link, esta pronto
-            if not display_alive(PLAYERS[m]["display"]):
-                spawn_instance(m)
+            # ja comeca a subir o jogo: quando o amigo abrir o link, esta pronto. O
+            # spawn.sh e idempotente; nao basta olhar a tela, que pode estar no ar
+            # sem o jogo (2026-10-14: amigo entrou numa tela preta)
+            spawn_instance(m)
             tok, exp = make_invite(m)
             print(f"convite: jogador {n} convidou jogador {m}, vence "
                   f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(exp))}", flush=True)
