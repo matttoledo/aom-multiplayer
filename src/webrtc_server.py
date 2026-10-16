@@ -1412,7 +1412,9 @@ def capture_frame():
 
 async def monitor_loop():
     while True:
-        capture_frame()
+        # Numa thread: o subprocess.run direto no event loop congelava o fan-out por
+        # ~190 ms a cada 2,17 s (medido no peer: travadas periodicas, 30 -> 26.9 fps).
+        await asyncio.to_thread(capture_frame)
         await asyncio.sleep(2)
 
 
