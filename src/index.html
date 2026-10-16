@@ -48,6 +48,23 @@
   #details[hidden] { display: none; }
   #stats { margin: 0 0 8px; font: 12px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
            color: #b9c3cf; white-space: pre-wrap; }
+  /* painel do controle: qual pad e do jogador e o estado dos botoes dele */
+  #pad { position: absolute; top: 12px; left: 12px; width: 300px; max-width: calc(100% - 24px);
+         background: rgba(22,26,32,.94); border: 1px solid var(--line); border-radius: 8px;
+         padding: 10px 12px; z-index: 2; }
+  #pad[hidden] { display: none; }
+  #pad h4 { margin: 0 0 6px; font-size: 13px; color: var(--accent); }
+  #roster { margin: 0 0 8px; font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+            color: var(--muted); white-space: pre-wrap; }
+  .prow { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; margin-bottom: 6px; }
+  .prow.pair { display: flex; gap: 10px; }
+  .prow.pair > div { flex: 1; display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+  .k { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 5px 4px;
+       border: 1px solid var(--line); border-radius: 6px; font: 11px/1.3 ui-monospace, monospace;
+       color: var(--muted); text-transform: uppercase; }
+  .k i { font-style: normal; color: #b9c3cf; }
+  .k.on { border-color: var(--accent); color: var(--accent); background: rgba(217,164,65,.14); }
+  .k.gap { border-color: transparent; }
   #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
            background: var(--bar); border: 1px solid var(--line); border-radius: 8px;
            padding: 10px 14px; box-shadow: 0 8px 24px rgba(0,0,0,.45); z-index: 3;
@@ -69,11 +86,22 @@
   </div>
   <button id="invite" class="primary" hidden>Convidar amigo</button>
   <button id="full" title="tela cheia (segure Esc para sair)">Tela cheia</button>
+  <button id="togglePad" aria-pressed="false">Controle</button>
   <button id="toggleDetails" aria-pressed="false">Detalhes</button>
 </header>
 <main id="stage">
   <canvas id="view" width="1280" height="720"></canvas>
   <video id="play" muted playsinline style="display:none"></video>
+  <aside id="pad" hidden>
+    <h4 id="padTitle">pad —</h4>
+    <pre id="roster"></pre>
+    <div class="prow" data-row="ombros"></div>
+    <div class="prow pair">
+      <div data-row="dpad"></div>
+      <div data-row="face"></div>
+    </div>
+    <div class="prow" data-row="centro"></div>
+  </aside>
   <aside id="details" hidden>
     <pre id="stats"></pre>
     <button id="probe">medir latência</button>
@@ -219,6 +247,9 @@ function updateStats() {
     ? (100 * rtcStats.perdidos / (rtcStats.recebidos + rtcStats.perdidos)).toFixed(2) + '%' : '-';
   stats.textContent =
     'jogador          ' + (jogador ?? '-') + '\n' +
+    'pad              ' + (padIndex == null ? '-' : padIndex) + '\n' +
+    'estado do pad    ' + hexMask(padState) + ' · seq ' + padSeq + '\n' +
+    'servidor ve      ' + hexMask(padServer) + (padNeutralizado ? ' neutralizado' : '') + '\n' +
     'conexao          ' + (pc ? pc.connectionState : '-') + '\n' +
     'codec            ' + (rtcStats.codecName ?? '-') + '\n' +
     'fps              ' + (rtcStats.fpsRtc ?? '-') + '\n' +
@@ -501,6 +532,7 @@ function reconnect(motivo) {
   if (ws && ws.readyState <= 1) { ws.onclose = null; ws.onmessage = null; ws.close(); }
   if (pc) { pc.close(); pc = null; inputDc = null; }
   clearInterval(pingTimer);
+  clearInterval(padTimer);
   const espera = Math.min(10000, 1000 * 2 ** tentativas);
   tentativas++;
   say('conexao caiu, reconectando em ' + (espera / 1000) + ' s…', 'warn');
@@ -534,6 +566,10 @@ function onOpen() {
   pingTimer = setInterval(() => {
     if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'ping', ts: performance.now() }));
   }, 30000);
+  // estado do pad mesmo sem mudanca: o prazo de 5 s do servidor conta a partir da
+  // ultima mensagem ACEITA, entao o keepalive tem que ser menor que ele
+  clearInterval(padTimer);
+  padTimer = setInterval(() => sendPad(true), PAD_KEEPALIVE);
 }
 
 // O motivo do fechamento vem no `error` do servidor, mas o close vinha depois e
@@ -543,6 +579,7 @@ function onClose(e) {
   if (aguardando) {
     aguardando = false;
     clearInterval(pingTimer);
+    clearInterval(padTimer);
     reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, 3000);
     return;
   }
@@ -583,11 +620,34 @@ function onMessage(e) {
         if (m.serverStart) serverStart = m.serverStart;
         document.getElementById('invite').hidden = !m.owner;
         jogador = m.player || null;
+        // pad atribuido pelo servidor (0..7). A sequencia continua da que o servidor ja
+        // tinha para este pad: zerar aqui faria o servidor descartar tudo depois de um F5.
+        padIndex = m.pad != null ? m.pad : null;
+        padSeq = m.seq || 0;
+        padServer = (m.buttons || []).reduce((mask, b) => mask | (PAD_BITS[b] || 0), 0);
+        padNeutralizado = false;
+        paintPad();
+        if (padIndex != null) sendPad(true);   // estado neutro: o pad acabou de ser neutralizado
         say(null);
         if (mode === 'mse') initMSE();
-        else if (mode === 'webrtc') initWebRTC();
+        else if (mode === 'webrtc' || mode === 'shared') initWebRTC();
         else decoder = makeDecoder();
-        if (audioCodec && mode !== 'webrtc') initAudioMSE();
+        // no modelo compartilhado o audio vem pelo mesmo canal P2P do video, nao pelo MSE
+        if (audioCodec && mode !== 'webrtc' && mode !== 'shared') initAudioMSE();
+      } else if (m.t === 'pad-ack' || m.t === 'pad-state') {
+        // O servidor e a autoridade da sequencia. Se ele descarta uma sequencia, o
+        // cliente tem que continuar acima da dele, senao toda mensagem seguinte tambem
+        // seria descartada.
+        if (m.pad != null) padIndex = m.pad;
+        if (m.seq != null) padSeq = Math.max(padSeq, m.seq);
+        padServer = (m.buttons || []).reduce((mask, b) => mask | (PAD_BITS[b] || 0), 0);
+        padNeutralizado = !!m.neutralizado;
+        paintPad();
+        // o servidor neutralizou o pad (prazo sem atualizacao): o estado que o cliente
+        // ainda tem precisa ser reafirmado, senao o pad fica neutro para o emulador
+        // enquanto o jogador continua com o dedo na tecla
+        if (m.descartado || padNeutralizado) sendPad(true);
+        updateStats();
       } else if (m.t === 'answer') {
         if (m.serverStart) serverStart = m.serverStart;
         if (pc) pc.setRemoteDescription({ type: 'answer', sdp: m.sdp });
@@ -658,6 +718,177 @@ function send(obj) {
   else if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj));
 }
 
+/* ---------- DualShock 2 ----------
+   O input e ESTADO COMPLETO + SEQUENCIA, nao press/release. Das duas formas que o
+   servidor aceita (src/pad.py), o cliente fixa a lista:
+
+     { t: 'pad', seq: <inteiro crescente>, buttons: [nomes dos botoes pressionados] }
+
+   Nomes canonicos, os mesmos de src/pad.py (e o pad.py quem injeta no /dev/uinput):
+     dpad_up dpad_right dpad_down dpad_left select start l1 r1 l2 r2
+     square cross circle triangle stick
+   `stick` e o press do analogico (BTN_THUMBL, code 317). O servidor nao tem l3/r3:
+   mandar "l3" cai em desconhecidos. O DualShock tem L3 e R3, o pad virtual tem um botao
+   so, entao os dois vao para `stick`.
+
+   Bitmask interno, um bit por botao, ordem fixada (e o contrato; o transporte manda os
+   nomes, mas qualquer formato futuro tem que usar esta ordem):
+
+     bit 0  dpad_up    0x0001   bit 8  l2         0x0100
+     bit 1  dpad_right 0x0002   bit 9  r2         0x0200
+     bit 2  dpad_down  0x0004   bit 10 square     0x0400
+     bit 3  dpad_left  0x0008   bit 11 cross      0x0800
+     bit 4  select     0x0010   bit 12 circle     0x1000
+     bit 5  start      0x0020   bit 13 triangle   0x2000
+     bit 6  l1         0x0040   bit 14 stick      0x4000
+     bit 7  r1         0x0080
+
+   seq: cresce a cada mensagem enviada e NUNCA zera. O servidor descarta seq <= ultima
+   vista por pad, e o mesmo token cai sempre no mesmo pad com a sequencia de antes: se o
+   cliente zerasse a seq depois de um F5, toda mensagem seguinte seria descartada. Por
+   isso a seq continua do valor que o servidor devolve no hello-ok.
+*/
+const PAD_BITS = {
+  dpad_up: 0x0001, dpad_right: 0x0002, dpad_down: 0x0004, dpad_left: 0x0008,
+  select: 0x0010, start: 0x0020,
+  l1: 0x0040, r1: 0x0080, l2: 0x0100, r2: 0x0200,
+  square: 0x0400, cross: 0x0800, circle: 0x1000, triangle: 0x2000,
+  stick: 0x4000,
+};
+
+/* Teclado -> DualShock 2. e.code (tecla FISICA), nao e.key: num ABNT2 ou AZERTY a letra
+   nao esta onde o dedo espera, o code esta. O primeiro code de cada botao e o principal;
+   os aliases do mapa do Play!.js vao depois e nao colidem.
+
+   A divisao e por mao: a direita move (setas), a esquerda chuta/passa. Num jogo de
+   futebol as duas trabalham ao mesmo tempo o tempo todo, e os botoes que ficam
+   segurados precisam cair num dedo livre:
+   - o pinky esquerdo ja cobre Square (A) e Cross (Z), entao L1 e L2 vao no medio e no
+     index (C e B): na defesa se segura L1 trocando jogador enquanto Cross carrinha;
+   - a mao direita esta nas setas e o pinky dela fica livre, entao R1 (corrida, segurada
+     o jogo inteiro) e R2 vao em Shift dir e Ctrl dir;
+   - Select e o press do analogico sao raros, vao nos dedos que sobram (V e Espaco).
+   Unico dedo que divide trabalho: o pinky direito (R1/R2) e o esquerdo (Square/Cross).
+   As combinacoes que exigiriam os dois ao mesmo tempo (L1+L2, R1+R2) sao as raras do
+   jogo, e o mapa inteiro e uma tabela: remapear e mudar estas linhas. */
+const PAD_KEYS = {
+  ArrowUp: 'dpad_up', ArrowRight: 'dpad_right', ArrowDown: 'dpad_down', ArrowLeft: 'dpad_left',
+  KeyA: 'square', KeyZ: 'cross', KeyS: 'triangle', KeyX: 'circle',
+  KeyC: 'l1', KeyB: 'l2',
+  ShiftRight: 'r1', ControlRight: 'r2',
+  Space: 'stick',
+  KeyV: 'select', Enter: 'start',
+  Digit1: 'l1', Digit8: 'r1', ContextMenu: 'stick',   // aliases do Play!.js
+};
+
+let padIndex = null;      // pad do jogador (0..7): quem decide e o servidor, no hello-ok
+let padState = 0;         // bitmask local: o que este cliente esta mandando
+let padServer = 0;        // bitmask confirmado pelo servidor (pad-ack / pad-state)
+let padSeq = 0;           // sequencia crescente, herdada do servidor, nao zera
+let padSent = -1;         // ultimo mask que saiu; -1 = nada enviado ainda
+let padPress = new Set();  // codes pressionados: sem auto-repeat e sem press duplicado
+let padTimer = null;
+let padNeutralizado = false;
+
+/* Keepalive de estado. O servidor neutraliza o pad quando fica PAD_STALE (5 s) sem
+   mensagem ACEITA do cliente; o ping de 30 s que ja existe cuida do Cloudflare, mas e
+   longo demais para o pad: um botao que nao conseguiu soltar (rede caiu com R1 segurado,
+   Alt+Tab, aba fechada) ficaria preso ate 5 s em plena partida. 2 s mantem o pior caso
+   em 2 s, custa ~4 mensagens/s com 8 jogadores e deixa 3 s de folga para o prazo do
+   servidor — um ping perdido nao neutraliza um jogador saudavel. */
+const PAD_KEEPALIVE = 2000;
+
+function padNames(mask) {
+  return Object.keys(PAD_BITS).filter((b) => (mask & PAD_BITS[b]) !== 0);
+}
+function hexMask(m) { return '0x' + m.toString(16).padStart(4, '0'); }
+
+function sendPad(force) {
+  if (padIndex == null) return;
+  if (!force && padState === padSent) return;
+  padSeq++;
+  padSent = padState;
+  send({ t: 'pad', seq: padSeq, buttons: padNames(padState) });
+  paintPad();
+}
+
+/* Estado neutro ao perder o foco: sem isso o Alt+Tab prende o botao no emulador. Mas
+   isto e otimizacao, nao autoridade — a mensagem pode nao chegar. Quem neutraliza de
+   verdade e o servidor, ao desconectar ou quando o prazo sem atualizacao vence. */
+function neutralizePad() {
+  if (!padState) return;
+  padState = 0;
+  padPress.clear();
+  sendPad(true);
+}
+window.addEventListener('blur', neutralizePad);
+document.addEventListener('visibilitychange', () => { if (document.hidden) neutralizePad(); });
+
+/* Espelho do bloqueio do servidor (BLOCKED_KEYS / BLOCKED_COMBOS): estes atalhos
+   atingem o desktop, nao o jogo. O servidor ja descarta, mas o cliente tambem nao envia.
+   O cliente acompanha os modificadores exatamente como o servidor, porque a combinacao
+   so pode ser decidida com o estado dos modificadores. */
+const MOD_KEYS = { Alt: 'alt', AltGraph: 'alt', Control: 'ctrl', Meta: 'meta', Shift: 'shift' };
+const BLOCKED_KEYS = new Set(['Meta', 'Super_L', 'Super_R']);
+let mods = new Set();
+
+function blocked(e) {
+  const mod = MOD_KEYS[e.key];
+  if (mod) { if (e.type === 'keydown') mods.add(mod); else mods.delete(mod); }
+  if (BLOCKED_KEYS.has(e.key)) return true;
+  if ((e.key === 'Tab' || e.key === 'F4' || e.key === 'F2') && mods.has('alt')) return true;
+  if ((e.key === 'Delete' || e.key === 'Escape') && mods.has('ctrl') && mods.has('alt')) return true;
+  return false;
+}
+
+/* Painel do controle: linhas na ordem fisica do DualShock 2. O rotulo de cada tecla vem
+   do mapa, nao de HTML fixo, para o painel nao poder divergir do que o cliente envia. */
+const padPanel = document.getElementById('pad');
+const padTitle = document.getElementById('padTitle');
+const padRoster = document.getElementById('roster');
+const PAD_ROWS = {
+  ombros: ['l1', 'l2', 'r1', 'r2'],
+  dpad: [null, 'dpad_up', null, 'dpad_left', null, 'dpad_right', null, 'dpad_down', null],
+  face: [null, 'triangle', null, 'square', null, 'circle', null, 'cross', null],
+  centro: ['select', 'start', 'stick'],
+};
+const KEY_LABEL = { ArrowUp: '↑', ArrowRight: '→', ArrowDown: '↓', ArrowLeft: '←',
+                    ShiftRight: 'Shift dir', ControlRight: 'Ctrl dir', ContextMenu: 'Menu',
+                    Space: 'Espaço', Enter: 'Enter' };
+function keyLabel(btn) {
+  const code = Object.keys(PAD_KEYS).find((c) => PAD_KEYS[c] === btn);
+  return KEY_LABEL[code] || code.replace('Key', '');
+}
+for (const [row, buttons] of Object.entries(PAD_ROWS)) {
+  const host = padPanel.querySelector('[data-row="' + row + '"]');
+  for (const b of buttons) {
+    const el = document.createElement('span');
+    if (!b) { el.className = 'k gap'; }
+    else {
+      el.className = 'k';
+      el.dataset.b = b;
+      el.innerHTML = '<i>' + keyLabel(b) + '</i>' + b;
+    }
+    host.appendChild(el);
+  }
+}
+
+function paintPad() {
+  padTitle.textContent = padIndex == null ? 'pad —' : 'pad ' + padIndex + ' · ' + (jogador ?? 'jogador ?');
+  // O cliente so conhece o proprio pad. A lista e a regra que o servidor usa
+  // (pad = jogador - 1, vagas 0..7); os outros jogadores so aparecem quando o servidor
+  // mandar a lista de pads.
+  const linhas = [];
+  for (let i = 0; i < 8; i++) {
+    linhas.push('pad ' + i + '  jogador ' + (i + 1) + (i === padIndex ? '  ← você' : ''));
+  }
+  padRoster.textContent = linhas.join('\n');
+  padPanel.querySelectorAll('.k').forEach((el) => {
+    el.classList.toggle('on', (padState & PAD_BITS[el.dataset.b]) !== 0);
+  });
+}
+
+
 document.getElementById('probe').addEventListener('click', () => {
   probeLatency = null;
   probe = null;
@@ -718,6 +949,12 @@ document.getElementById('toggleDetails').addEventListener('click', (e) => {
   updateStats();
 });
 
+document.getElementById('togglePad').addEventListener('click', (e) => {
+  padPanel.hidden = !padPanel.hidden;
+  e.currentTarget.setAttribute('aria-pressed', String(!padPanel.hidden));
+  paintPad();
+});
+
 // Tela cheia no palco, nao no <video>: em tela cheia de video o Chrome se comporta
 // como player (overlay de midia, atalhos de video). O Keyboard Lock (Chrome) segura
 // as teclas que o navegador tomaria para si, como Esc: o Esc vai para o jogo, e
@@ -760,8 +997,31 @@ document.addEventListener('mousemove', (e) => {
 // teclas com o foco num controle da pagina (a barra de volume) nao vao para o jogo:
 // sem isso as setas mexeriam no volume e na camera ao mesmo tempo
 const noControle = (e) => e.target instanceof HTMLInputElement;
-document.addEventListener('keydown', (e) => { if (!noControle(e)) send({ t: 'key', key: e.key, down: true }); });
-document.addEventListener('keyup', (e) => { if (!noControle(e)) send({ t: 'key', key: e.key, down: false }); });
+
+document.addEventListener('keydown', (e) => {
+  if (noControle(e) || blocked(e)) return;
+  const b = PAD_KEYS[e.code];
+  // sem auto-repeat: o navegador repete o keydown enquanto a tecla fica segurada, e
+  // cada repeticao seria uma mensagem nova de estado com a sequencia subindo a toa
+  if (b && !e.repeat && !padPress.has(e.code)) {
+    padPress.add(e.code);
+    padState |= PAD_BITS[b];
+    sendPad(true);
+  }
+  // o caminho de tecla continua: o menu do emulador aceita teclado e o servidor trata
+  // t:key pelo XTest. Para o jogo, o que vale e o estado do pad.
+  send({ t: 'key', key: e.key, down: true });
+});
+document.addEventListener('keyup', (e) => {
+  if (noControle(e) || blocked(e)) return;
+  const b = PAD_KEYS[e.code];
+  if (b && padPress.has(e.code)) {
+    padPress.delete(e.code);
+    padState &= ~PAD_BITS[b];
+    sendPad(true);
+  }
+  send({ t: 'key', key: e.key, down: false });
+});
 
 connect();
 </script>
