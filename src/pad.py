@@ -36,7 +36,9 @@ SYN_REPORT = 0
 PAD_BUTTONS = {
     "cross": 304, "circle": 305, "square": 306, "triangle": 307,
     "l1": 310, "r1": 311, "l2": 312, "r2": 313,
-    "select": 315, "start": 316, "stick": 317,
+    # BTN_SELECT 314, BTN_START 315, BTN_THUMBL 317 (316 e BTN_MODE, o Guide). Estavam
+    # um acima: Enter (start) apertava o Guide, que o PCSX2 ignora, e V (select) o Start.
+    "select": 314, "start": 315, "stick": 317,
     "dpad_up": 544, "dpad_down": 545, "dpad_left": 546, "dpad_right": 547,
 }
 BUTTON_ALIASES = {
@@ -162,7 +164,7 @@ class UinputPad:
         # vendor/product decidem se o SDL reconhece o pad como game controller. Com IDs
         # desconhecidos o PCSX2 nao tem mapeamento e nenhum botao chega ao jogo; com IDs
         # de um controlador conhecido ele aplica o mapeamento padrao. Os codigos evdev do
-        # pad (304..317, 544..547) ja sao os standard que o SDL espera.
+        # pad (304..317, 544..547; sem o 316) ja sao os standard que o SDL espera.
         self.vendor = vendor
         self.product = product
 
