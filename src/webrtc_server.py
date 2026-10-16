@@ -44,7 +44,7 @@ import aiortc.rtcrtpsender
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.rtcconfiguration import RTCConfiguration, RTCIceServer
 from aiortc.codecs.h264 import H264Encoder
-from aiortc.mediastreams import MediaStreamError, MediaStreamTrack
+from aiortc.mediastreams import MediaStreamError, MediaStreamTrack, VIDEO_TIME_BASE, convert_timebase
 from aiortc.rtcicetransport import RTCIceCandidate
 from aiortc.sdp import candidate_from_sdp
 
@@ -58,6 +58,9 @@ from Xlib.ext import xtest
 from Xlib.XK import string_to_keysym
 
 from marker import Marker
+
+from fanout import AudioSource, AudioFanoutTrack, FanoutSource, FanoutTrack
+from pad import Pad, UinputPad, pad_state
 
 # aiortc engole excecao do encoder com __log_warning; sem handler nada aparece no log
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -75,6 +78,21 @@ BITRATE = int(os.environ.get("BITRATE", "17000000"))
 MAX_BITRATE = int(os.environ.get("MAX_BITRATE", "20000000"))
 PRESET = os.environ.get("PRESET", "p4")
 PORT = int(os.environ.get("PORT", "8081"))
+
+# Modelo novo (futebol, Bomba Patch / Winning Eleven 10): UMA instancia de emulador
+# compartilhada, um pad virtual por jogador (uinput, indice 0..MAX_PADS-1) e UM
+# encoder consumido por N conexoes. O caminho de 1 jogador (uma instancia por jogador,
+# XTest por display) continua igual quando AOM_MODE=solo, que e o padrao.
+MODE = os.environ.get("AOM_MODE", "solo")
+MAX_PADS = int(os.environ.get("AOM_MAX_PADS", "8"))
+SHARED_DISPLAY = os.environ.get("AOM_SHARED_DISPLAY", DISPLAY_NAME)
+SHARED_SLOT = os.environ.get("AOM_SHARED_SLOT", SLOT)
+# Prazo sem atualizacao do estado do pad. A neutralizacao acontece no servidor, porque
+# a ultima mensagem do cliente pode nunca chegar.
+PAD_STALE = int(os.environ.get("AOM_PAD_STALE", "5"))
+# Periodo do estado periodico do pad: o cliente precisa poder reconstruir o pad depois
+# de reconectar sem mandar nada.
+PAD_REPORT = int(os.environ.get("AOM_PAD_REPORT", "2"))
 
 # Audio do slot do jogador (mesmo esquema do server.py): o jogo toca no sink
 # aom_slotN e o monitor dele e capturado. Aqui vai em Opus dentro do WebRTC, nao em
@@ -280,6 +298,8 @@ def player_for(token):
 
 # jogador -> websocket ativo: uma sessao por jogador. Reconectar (F5, troca de rede)
 # derruba a sessao antiga, senao duas abas disputariam a mesma tela e o mesmo input.
+# No modelo compartilhado e a mesma coisa por pad: substituir a conexao de um pad nao
+# pode derrubar os outros jogadores.
 # Valor: {"ws": websocket da sessao, "end": Event que encerra a sessao}. O Event
 # existe porque a sessao pode seguir sem WebSocket (input pelo DataChannel).
 ACTIVE = {}
@@ -468,6 +488,18 @@ class NvencH264Encoder(H264Encoder):
                       f"{avg:.0f} B/frame, {avg * FPS * 8 / 1000:.0f} kbps", flush=True)
             yield from self._split_bitstream(data)
 
+    def encode_raw(self, frame, force_keyframe):
+        """Access unit cru (Annex-B) + timestamp em 90 kHz: o que o fan-out entrega a
+        cada peer. A packetizacao continua por conexao; o que nao pode ser feito N
+        vezes e o NVENC. Este e o unico encoder que abre sessao no GPU: os encoders
+        dos peers sao chamados so por pack(), que nao abre codec.
+        """
+        nals = list(self._encode_frame(frame, force_keyframe))
+        ts = convert_timebase(frame.pts, frame.time_base, VIDEO_TIME_BASE)
+        if not nals:
+            return b"", ts
+        return b"".join(b"\x00\x00\x01" + nal for nal in nals), ts
+
 
 def _get_encoder(codec):
     if codec.mimeType.lower() == "video/h264":
@@ -501,6 +533,21 @@ async def _retransmit(self, seq):
 
 
 aiortc.rtcrtpsender.RTCRtpSender._retransmit = _retransmit
+
+# PLI/FIR de um peer peca keyframe na FONTE compartilhada, nao so na conexao dele: com
+# uma sessao NVENC para todos, o keyframe e o mesmo para todos. O override original
+# continua marcando o flag do sender, que vale no caminho de 1 jogador.
+_send_keyframe_orig = aiortc.rtcrtpsender.RTCRtpSender._send_keyframe
+
+
+def _send_keyframe(self):
+    _send_keyframe_orig(self)
+    source = getattr(self.track, "source", None)
+    if source is not None:
+        source.request_keyframe()
+
+
+aiortc.rtcrtpsender.RTCRtpSender._send_keyframe = _send_keyframe
 
 
 class CaptureTrack(MediaStreamTrack):
@@ -758,6 +805,295 @@ async def hide_later(marker, seconds=4.0):
     marker.hide()
 
 
+# Instancia compartilhada: uma captura, um encoder, um pad por jogador. Criada na
+# primeira entrada e mantida enquanto houver peer. O display, o slot e o encoder NAO
+# pertencem a um peer: fechar uma conexao nao pode derrubar os outros.
+ROOM = None   # {"display", "slot", "disp", "win", "source", "audio", "pads"}
+
+
+async def get_room(loop):
+    if ROOM is not None:
+        return ROOM
+
+    try:
+        disp = Display(SHARED_DISPLAY)
+    except Exception as e:
+        print(f"instancia compartilhada: sem tela {SHARED_DISPLAY} ({e})", flush=True)
+        return None
+
+    pads = {}
+    for i in range(MAX_PADS):
+        device = UinputPad(i)
+        device.open()
+        pads[i] = Pad(i, device, stale=PAD_STALE)
+
+    source = FanoutSource(SHARED_DISPLAY, NvencH264Encoder().encode_raw, loop)
+    if not await source.start():
+        disp.close()
+        for pad in pads.values():
+            pad.close()
+        return None
+
+    audio = AudioSource(SHARED_SLOT) if AUDIO else None
+    if audio:
+        await audio.start()
+
+    win = find_window(disp)
+    focus_game(disp, win)
+    ROOM = {"display": SHARED_DISPLAY, "slot": SHARED_SLOT, "disp": disp, "win": win,
+           "source": source, "audio": audio, "pads": pads}
+    print(f"instancia compartilhada: {MAX_PADS} pads, tela {SHARED_DISPLAY}, "
+          f"slot {SHARED_SLOT}", flush=True)
+    return ROOM
+
+
+def close_room_if_idle():
+    """Sem peers a fonte fecha. Um peer sair nunca fecha: e a regra de nao derrubar os
+    outros. O pad do peer que saiu ja foi neutralizado pela sessao.
+    """
+    global ROOM
+    if ROOM is None or ACTIVE:
+        return
+    ROOM["source"].stop()
+    if ROOM["audio"]:
+        ROOM["audio"].stop()
+    for pad in ROOM["pads"].values():
+        pad.close()
+    ROOM["disp"].close()
+    ROOM = None
+    print("instancia compartilhada: sem peers, fonte fechada", flush=True)
+
+
+async def shared_session(ws, n, info):
+    """Sessao no modelo compartilhado: uma instancia, um pad por jogador, um encoder
+    consumido por N peers. Entrar ou sair mexe so no pad e na fila do peer; os outros
+    peers seguem recebendo o mesmo stream.
+    """
+    loop = asyncio.get_running_loop()
+    pad_index = n - 1
+    if pad_index >= MAX_PADS:
+        print(f"hello negado: jogador {n} sem pad (teto {MAX_PADS}), ip={info['ip']}", flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": f"sem pad (teto {MAX_PADS})"}))
+        return
+
+    room = await get_room(loop)
+    if room is None:
+        print(f"hello negado: instancia compartilhada fora do ar, ip={info['ip']}", flush=True)
+        await ws.send(json.dumps({"t": "error", "msg": "instancia compartilhada fora do ar"}))
+        return
+
+    old = ACTIVE.get(n)
+    if old is not None and old["ws"] is not ws:
+        print(f"jogador {n}: nova conexao substitui a anterior", flush=True)
+        old["end"].set()
+        await old["ws"].close(4000, "sessao aberta em outro lugar")
+
+    session = {"ws": ws, "end": asyncio.Event()}
+    ACTIVE[n] = session
+
+    def send_json(obj):
+        try:
+            asyncio.create_task(ws.send(json.dumps(obj)))
+        except Exception:
+            pass
+
+    video = room["source"].subscribe(f"jogador {n}")
+    audio = room["audio"].subscribe(f"jogador {n}") if AUDIO else None
+    pad = room["pads"][pad_index]
+
+    marker = Marker(room["disp"])
+    game = {"win": room["win"]}
+    pressed = set()          # modificadores do teclado, se o cliente usar teclado
+    stats = {"blocked": 0, "stale_seq": 0, "applied": 0}
+
+    print(f"entrada: jogador={n} pad={pad_index} tela={room['display']} slot={room['slot']} "
+          f"ip={info['ip']} hora={time.strftime('%Y-%m-%d %H:%M:%S')}", flush=True)
+
+    servers = ice_servers(await turn_credentials())
+    pc = RTCPeerConnection(RTCConfiguration(iceServers=servers))
+    track = FanoutTrack(room["source"], video, send_json)
+    pc.addTrack(track)
+    audio_track = AudioFanoutTrack(room["audio"], audio) if audio else None
+    if audio_track:
+        audio_sender = pc.addTrack(audio_track)
+        # mesmo motivo do caminho de 1 jogador: com msid comum o video passa a esperar
+        # o buffer do audio
+        audio_sender._stream_id = str(uuid.uuid4())
+
+    @pc.on("icecandidate")
+    def on_ice(candidate):
+        if candidate and candidate.candidate:
+            send_json({"t": "ice", "candidate": {
+                "candidate": candidate.candidate,
+                "sdpMLineIndex": 0,
+            }})
+
+    @pc.on("connectionstatechange")
+    def on_state():
+        print(f"estado: jogador={n} pad={pad_index} {pc.connectionState} "
+              f"hora={time.strftime('%H:%M:%S')}", flush=True)
+        if pc.connectionState in ("failed", "closed"):
+            session["end"].set()
+
+    def pad_json(neutralizado=False):
+        obj = {"t": "pad-state", "pad": pad_index, "seq": pad.seq, "buttons": pad.snapshot()}
+        if neutralizado:
+            obj["neutralizado"] = True
+        return obj
+
+    def on_event(ev, reply):
+        t = ev.get("t")
+        if t == "ping":
+            reply({"t": "pong", "client_ts": ev.get("ts"), "server_ts": time.time()})
+        elif t == "probe":
+            drawn = marker.draw()
+            reply({"t": "probe-at", "drawn": drawn})
+            asyncio.create_task(hide_later(marker))
+        elif t == "pad":
+            seq, buttons = pad_state(ev)
+            _, motivo = pad.apply(seq, buttons)
+            if motivo:
+                stats["stale_seq"] += 1
+            else:
+                stats["applied"] += 1
+            # o estado aceito volta: o cliente confirma que a sequencia entrou e fica
+            # com a mesma visao do pad depois de um reorder
+            reply({"t": "pad-ack", "pad": pad_index, "seq": pad.seq,
+                   "buttons": pad.snapshot(), "descartado": bool(motivo)})
+        elif t in ("key", "move", "mouse"):
+            # teclado continua: o menu do emulador aceita teclado, e os atalhos de
+            # sistema continuam bloqueados antes de injetar
+            apply_input(room["disp"], ev, pressed, stats, game)
+
+    async def pad_loop():
+        """Estado do pad a cada PAD_REPORT s, mesmo sem mudanca: o cliente precisa
+        poder reconstruir o pad depois de reconectar sem mandar nada. Se o pad fica
+        PAD_STALE s sem atualizacao do cliente, ele e neutralizado AQUI, no servidor,
+        porque a ultima mensagem do cliente pode nunca chegar. O estado periodico do
+        servidor nao renova o prazo.
+        """
+        while not session["end"].is_set():
+            try:
+                await asyncio.wait_for(session["end"].wait(), timeout=PAD_REPORT)
+                break
+            except asyncio.TimeoutError:
+                if pad.stale():
+                    pad.neutralize(f"sem atualizacao ha {PAD_STALE} s")
+                    send_json(pad_json(neutralizado=True))
+                else:
+                    send_json(pad_json())
+
+    channels = {}
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        if channel.label != "input":
+            return
+        channels["input"] = channel
+
+        def reply(obj):
+            if channel.readyState == "open":
+                channel.send(json.dumps(obj))
+
+        @channel.on("message")
+        def on_message(msg):
+            if not isinstance(msg, str):
+                return
+            try:
+                on_event(json.loads(msg), reply)
+            except Exception as e:
+                print(f"datachannel jogador {n}: {e!r}", flush=True)
+
+        @channel.on("close")
+        def on_close():
+            session["end"].set()
+
+    # Handshake de atribucao de pad: o servidor diz o indice e o estado atual. O mesmo
+    # token sempre recebe o mesmo pad; reconectar nao muda o pad.
+    await ws.send(json.dumps({
+        "t": "hello-ok",
+        "mode": "shared",
+        "ice": ice_json(servers),
+        # com TURN configurado, forcar relay: sem isso o navegador tenta primeiro o
+        # candidato host, que nunca funciona para um cliente remoto
+        "relay": bool(servers),
+        "owner": n == OWNER and bool(INVITE_KEY),
+        "player": n,
+        "pad": pad_index,
+        "seq": pad.seq,
+        "buttons": pad.snapshot(),
+    }))
+    pad_task = asyncio.create_task(pad_loop())
+
+    try:
+        async for raw in ws:
+            try:
+                ev = json.loads(raw)
+            except Exception:
+                continue
+            t = ev.get("t")
+            if t == "offer":
+                await pc.setRemoteDescription(
+                    RTCSessionDescription(ev["sdp"], "offer"))
+                answer = await pc.createAnswer()
+                # aiortc nao faz trickle ICE: o gathering acontece em
+                # setLocalDescription e os candidatos entram no SDP.
+                await pc.setLocalDescription(answer)
+                await ws.send(json.dumps({
+                    "t": "answer",
+                    "sdp": pc.localDescription.sdp,
+                    # serverStart do PEER: o frame que ele recebe com mediaTime=0 nao
+                    # e o primeiro frame da fonte compartilhada
+                    "serverStart": track.start,
+                }))
+            elif t == "ice":
+                cand = ev.get("candidate", {})
+                line = cand.get("candidate", "")
+                if not line:
+                    await pc.addIceCandidate(None)
+                    continue
+                try:
+                    c = candidate_from_sdp(line)
+                    c.sdpMLineIndex = cand.get("sdpMLineIndex", 0)
+                    c.sdpMid = cand.get("sdpMid")
+                    await pc.addIceCandidate(c)
+                except Exception as e:
+                    print("ice:", e, flush=True)
+            else:
+                on_event(ev, send_json)
+    except websockets.exceptions.ConnectionClosed:
+        pass
+    finally:
+        log_ws_close(ws, n)
+        try:
+            dc = channels.get("input")
+            if (not session["end"].is_set() and pc.connectionState == "connected"
+                    and dc is not None and dc.readyState == "open"):
+                # o tunel caiu, mas video e input andam P2P: a partida segue
+                print(f"jogador {n}: sem WebSocket, sessao segue pelo DataChannel", flush=True)
+                await session["end"].wait()
+        finally:
+            # neutralizacao no servidor: o peer pode ter caido com um botao
+            # pressionado, e o emulador ficaria com o botao preso para todos
+            pad.neutralize("sessao encerrada")
+            await pc.close()
+            track.stop()
+            if audio_track:
+                audio_track.stop()
+            pad_task.cancel()
+            marker.close()
+            CONN.pop(ws, None)
+            if ACTIVE.get(n) is session:
+                ACTIVE.pop(n, None)
+            dur = time.time() - info["t0"]
+            # log por conexao: IP, entrada, saida e duracao. Nunca o conteudo digitado.
+            print(f"saida: jogador={n} pad={pad_index} ip={info['ip']} "
+                  f"hora={time.strftime('%Y-%m-%d %H:%M:%S')} duracao={dur:.0f}s "
+                  f"atalhos bloqueados={stats['blocked']} sequencias descartadas={stats['stale_seq']} "
+                  f"frames descartados={video.dropped}", flush=True)
+            close_room_if_idle()
+
+
 async def handler(ws):
     info = CONN.get(ws) or {"ip": "?", "token": "", "t0": time.time()}
     loop = asyncio.get_running_loop()
@@ -785,6 +1121,10 @@ async def handler(ws):
 
     if ev.get("decoder") != "webrtc":
         await ws.send(json.dumps({"t": "error", "msg": "use ?mode=webrtc"}))
+        return
+
+    if MODE == "shared":
+        await shared_session(ws, n, info)
         return
 
     RESERVED.pop(n, None)   # o convidado chegou: a vaga e dele
@@ -1037,8 +1377,13 @@ async def process_request(connection, request):
 
 
 async def main():
-    print(f"webrtc (aiortc): porta {PORT}, {WIDTH}x{HEIGHT}@{FPS}, jogadores: " +
-          ", ".join(f"{n}->{p['display']}/slot{p['slot']}" for n, p in PLAYERS.items()), flush=True)
+    if MODE == "shared":
+        print(f"webrtc (aiortc): porta {PORT}, {WIDTH}x{HEIGHT}@{FPS}, modo compartilhado "
+              f"(1 instancia, {MAX_PADS} pads, 1 encoder para N peers), tela {SHARED_DISPLAY}, "
+              f"slot {SHARED_SLOT}", flush=True)
+    else:
+        print(f"webrtc (aiortc): porta {PORT}, {WIDTH}x{HEIGHT}@{FPS}, jogadores: " +
+              ", ".join(f"{n}->{p['display']}/slot{p['slot']}" for n, p in PLAYERS.items()), flush=True)
     print(f"convites: {'on' if INVITE_KEY else 'off'}, teto {INVITE_MAX} jogadores, "
           f"spawn {'liberado' if CAN_SPAWN else 'sem permissao'} ({SPAWN})", flush=True)
     # ping de protocolo a cada 20 s + ping JSON do cliente a cada 30 s: um proxy ou o
