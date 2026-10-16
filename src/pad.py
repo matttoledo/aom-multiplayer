@@ -27,6 +27,7 @@ import time
 
 EV_SYN = 0
 EV_KEY = 1
+EV_ABS = 3
 SYN_REPORT = 0
 
 # Codigo dos botoes em linux/input-event-codes.h. Nomes canonicos + apelidos: o
@@ -44,6 +45,13 @@ BUTTON_ALIASES = {
     "up": "dpad_up", "down": "dpad_down", "left": "dpad_left", "right": "dpad_right",
 }
 
+# Eixos analogicos (linux/input-event-codes.h). O PCSX2/SDL so mostra "axes" se o
+# dispositivo tem EV_ABS com absinfo valido; sem isso o pad e "0 axes" e o jogo que usa
+# o analogico no menu nunca ve o movimento.
+PAD_AXES = {"lx": 0, "ly": 1, "rx": 2, "ry": 3}
+AXIS_MIN, AXIS_MAX = -1000, 1000
+AXIS_NEUTRO = 0
+
 # Prazo sem atualizacao do estado do pad. Contado a partir do ultimo evento ACEITO do
 # cliente; o estado periodico que o servidor manda nao renova o prazo.
 STALE_TIMEOUT = int(os.environ.get("AOM_PAD_STALE", "5"))
@@ -54,7 +62,10 @@ STALE_TIMEOUT = int(os.environ.get("AOM_PAD_STALE", "5"))
 # + __u32 value = 24 bytes. Com "qqIII" (28) o write nao devolve erro mas o kernel
 # interpreta os bytes errado e o leitor do eventN nao recebe nada — foi o que o
 # primeiro teste no asus mostrou.
-EVENT_FMT = "qqHHI"
+# struct input_event: timeval(16) + __u16 type + __u16 code + __s32 value = 24.
+# O value e SIGNADO: eixo analogico manda negativos, e "I" estoura com
+# "struct.error: 'I' format requires 0 <= number <= 4294967295".
+EVENT_FMT = "qqHHi"
 
 # _IOC(dir, type, nr, size) do kernel. UINPUT_IOCTL_BASE e 'U' maiusculo
 # (/usr/include/linux/uinput.h). Com 'u' minusculo o numero sai errado e o ioctl
@@ -67,6 +78,7 @@ UI_SET_EVBIT = _ioc(4, 100)
 UI_SET_KEYBIT = _ioc(4, 101)
 UI_SET_ABSBIT = _ioc(4, 103)
 UI_DEV_SETUP = _ioc(92, 3)          # struct uinput_setup: 8 + 80 + 4
+UI_ABS_SETUP = _ioc(28, 4)          # struct uinput_abs_setup: 2 + 2 + 24
 UI_DEV_CREATE = _ioc(0, 1, 0)
 UI_DEV_DESTROY = _ioc(0, 2, 0)
 
@@ -81,6 +93,18 @@ class UinputSetup(ctypes.Structure):
     # + ff_effects_max (4) = 92 bytes. O ultimo campo NAO e version.
     _fields_ = [("id", InputId), ("name", ctypes.c_char * 80),
                 ("ff_effects_max", ctypes.c_uint32)]
+
+
+class UinputAbsSetup(ctypes.Structure):
+    # struct uinput_abs_setup: code(2) + filler implicito(2) + input_absinfo(24) = 28.
+    # O input_absinfo do kernel comeca com VALUE, nao com minimum:
+    #   value, minimum, maximum, fuzz, flat, resolution
+    # Quem assume minimum no offset 4 escreve no campo errado e o kernel valida
+    # [0,0], aceitando so absinfo todo zero. Sem absinfo o SDL enxerga "0 axes".
+    _fields_ = [("code", ctypes.c_uint16), ("filler", ctypes.c_uint16),
+                ("value", ctypes.c_int32), ("minimum", ctypes.c_int32),
+                ("maximum", ctypes.c_int32), ("fuzz", ctypes.c_int32),
+                ("flat", ctypes.c_int32), ("resolution", ctypes.c_int32)]
 
 
 def button_name(key):
@@ -109,14 +133,38 @@ def pad_state(ev):
     return seq, []
 
 
+def pad_axes(ev):
+    """{eixo: valor} de um evento de estado. Eixo fora de [-1000,1000] e ignorado.
+
+    O protocolo de botoes esta fechado; os eixos analogicos entraram depois, porque o
+    PCSX2/SDL so ve eixos se o pad tem EV_ABS com absinfo, e o jogo pode usar o analogico
+    no menu. Valores fora do range do dispositivo sao descartados pelo kernel, entao
+    descartar aqui evita injetar algo que o leitor nunca recebe.
+    """
+    raw = ev.get("axes")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            name = (k or "").strip().lower()
+            if name in PAD_AXES and isinstance(v, (int, float)) and AXIS_MIN <= v <= AXIS_MAX:
+                out[name] = int(v)
+    return out
+
+
 class UinputPad:
     """Um pad evdev. Sem /dev/uinput (dev) o estado do Pad continua valendo; so nao
     se injeta nada, e e exatamente o que os testes medem."""
 
-    def __init__(self, index):
+    def __init__(self, index, vendor=0x045E, product=0x028E):
         self.index = index
         self.name = f"aom-pad{index}"
         self.fd = None
+        # vendor/product decidem se o SDL reconhece o pad como game controller. Com IDs
+        # desconhecidos o PCSX2 nao tem mapeamento e nenhum botao chega ao jogo; com IDs
+        # de um controlador conhecido ele aplica o mapeamento padrao. Os codigos evdev do
+        # pad (304..317, 544..547) ja sao os standard que o SDL espera.
+        self.vendor = vendor
+        self.product = product
 
     def open(self):
         try:
@@ -128,8 +176,14 @@ class UinputPad:
             fcntl.ioctl(fd, UI_SET_EVBIT, EV_KEY)
             for code in PAD_BUTTONS.values():
                 fcntl.ioctl(fd, UI_SET_KEYBIT, code)
+            fcntl.ioctl(fd, UI_SET_EVBIT, EV_ABS)
+            for code in PAD_AXES.values():
+                abs_setup = UinputAbsSetup(code=code, value=AXIS_NEUTRO,
+                                           minimum=AXIS_MIN, maximum=AXIS_MAX,
+                                           fuzz=0, flat=0, resolution=0)
+                fcntl.ioctl(fd, UI_ABS_SETUP, bytes(abs_setup))
             setup = UinputSetup()
-            setup.id = InputId(bustype=0x19, vendor=0x045E, product=0x00E0, version=1)
+            setup.id = InputId(bustype=0x19, vendor=self.vendor, product=self.product, version=1)
             setup.name = self.name.encode()
             setup.ff_effects_max = 0
             fcntl.ioctl(fd, UI_DEV_SETUP, bytes(setup))
@@ -150,6 +204,12 @@ class UinputPad:
         self._write(EV_KEY, code, 1 if down else 0)
         # O evdev agrupa os eventos de um mesmo instante com SYN_REPORT; sem isso o
         # leitor do emulador pode nao considerar o estado completo.
+        self._write(EV_SYN, SYN_REPORT, 0)
+
+    def axis(self, code, value):
+        if self.fd is None:
+            return
+        self._write(EV_ABS, code, max(AXIS_MIN, min(AXIS_MAX, int(value))))
         self._write(EV_SYN, SYN_REPORT, 0)
 
     def _write(self, ev_type, code, value):
@@ -190,6 +250,7 @@ class Pad:
         self.stale_timeout = stale
         self.seq = 0
         self.pressed = set()
+        self.axes = {name: AXIS_NEUTRO for name in PAD_AXES}
         self.updated = time.time()
         self.stats = {"aceitos": 0, "sequencia_antiga": 0, "desconhecidos": 0,
                       "neutralizacoes": 0}
@@ -199,7 +260,12 @@ class Pad:
             return
         self.device.press(PAD_BUTTONS[name], down)
 
-    def apply(self, seq, buttons):
+    def _inject_axis(self, name, value):
+        if self.device is None:
+            return
+        self.device.axis(PAD_AXES[name], value)
+
+    def apply(self, seq, buttons, axes=None):
         """(mudou, motivo)."""
         if not isinstance(seq, int):
             return False, "sequencia ausente"
@@ -215,6 +281,10 @@ class Pad:
                 continue
             state.add(name)
 
+        new_axes = {name: AXIS_NEUTRO for name in PAD_AXES}
+        for name, value in (axes or {}).items():
+            new_axes[name] = value
+
         self.seq = seq
         self.updated = time.time()
         self.stats["aceitos"] += 1
@@ -226,19 +296,28 @@ class Pad:
         for name in sorted(self.pressed - state):
             self._inject(name, False)
             changed = True
+        for name in sorted(new_axes):
+            if new_axes[name] != self.axes[name]:
+                self._inject_axis(name, new_axes[name])
+                changed = True
         self.pressed = state
+        self.axes = new_axes
         return changed, None
 
     def stale(self):
         return time.time() - self.updated > self.stale_timeout
 
     def neutralize(self, motivo):
-        if not self.pressed:
+        if not self.pressed and not any(self.axes.values()):
             return False
         soltos = sorted(self.pressed)
         for name in soltos:
             self._inject(name, False)
+        for name in sorted(self.axes):
+            if self.axes[name] != AXIS_NEUTRO:
+                self._inject_axis(name, AXIS_NEUTRO)
         self.pressed = set()
+        self.axes = {name: AXIS_NEUTRO for name in PAD_AXES}
         self.stats["neutralizacoes"] += 1
         print(f"pad {self.index}: neutralizado ({motivo}), {len(soltos)} botao(s) "
               f"soltos, seq={self.seq}", flush=True)
