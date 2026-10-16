@@ -60,7 +60,7 @@ from Xlib.XK import string_to_keysym
 from marker import Marker
 
 from fanout import AudioSource, AudioFanoutTrack, FanoutSource, FanoutTrack
-from pad import Pad, UinputPad, pad_state
+from pad import Pad, UinputPad, pad_axes, pad_state
 
 # aiortc engole excecao do encoder com __log_warning; sem handler nada aparece no log
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
@@ -85,6 +85,7 @@ PORT = int(os.environ.get("PORT", "8081"))
 # XTest por display) continua igual quando AOM_MODE=solo, que e o padrao.
 MODE = os.environ.get("AOM_MODE", "solo")
 MAX_PADS = int(os.environ.get("AOM_MAX_PADS", "8"))
+SLOT = os.environ.get("SLOT", "1")
 SHARED_DISPLAY = os.environ.get("AOM_SHARED_DISPLAY", DISPLAY_NAME)
 SHARED_SLOT = os.environ.get("AOM_SHARED_SLOT", SLOT)
 # Prazo sem atualizacao do estado do pad. A neutralizacao acontece no servidor, porque
@@ -97,7 +98,6 @@ PAD_REPORT = int(os.environ.get("AOM_PAD_REPORT", "2"))
 # Audio do slot do jogador (mesmo esquema do server.py): o jogo toca no sink
 # aom_slotN e o monitor dele e capturado. Aqui vai em Opus dentro do WebRTC, nao em
 # AAC/fMP4: o RTP leva o audio no mesmo transporte P2P do video.
-SLOT = os.environ.get("SLOT", "1")
 SLOT_PREFIX = os.environ.get("SLOT_PREFIX", "aom_slot")
 AUDIO = os.environ.get("AUDIO", "1") == "1"
 AUDIO_RATE = 48000
@@ -811,7 +811,8 @@ async def hide_later(marker, seconds=4.0):
 ROOM = None   # {"display", "slot", "disp", "win", "source", "audio", "pads"}
 
 
-async def get_room(loop):
+async def get_room(loop, startup=False):
+    global ROOM
     if ROOM is not None:
         return ROOM
 
@@ -841,7 +842,7 @@ async def get_room(loop):
     win = find_window(disp)
     focus_game(disp, win)
     ROOM = {"display": SHARED_DISPLAY, "slot": SHARED_SLOT, "disp": disp, "win": win,
-           "source": source, "audio": audio, "pads": pads}
+           "source": source, "audio": audio, "pads": pads, "startup": startup}
     print(f"instancia compartilhada: {MAX_PADS} pads, tela {SHARED_DISPLAY}, "
           f"slot {SHARED_SLOT}", flush=True)
     return ROOM
@@ -853,6 +854,11 @@ def close_room_if_idle():
     """
     global ROOM
     if ROOM is None or ACTIVE:
+        return
+    # Uma sala criada na subida do servidor nao fecha: os pads sao os mesmos que o
+    # emulador mapeou (SDL enumera por ordem de criacao). Fechar e reabrir mudaria os
+    # ids do SDL e a mapping ficaria apontando para os pads errados.
+    if ROOM.get("startup"):
         return
     ROOM["source"].stop()
     if ROOM["audio"]:
@@ -951,7 +957,7 @@ async def shared_session(ws, n, info):
             asyncio.create_task(hide_later(marker))
         elif t == "pad":
             seq, buttons = pad_state(ev)
-            _, motivo = pad.apply(seq, buttons)
+            _, motivo = pad.apply(seq, buttons, pad_axes(ev))
             if motivo:
                 stats["stale_seq"] += 1
             else:
@@ -1358,6 +1364,46 @@ async def handler(ws):
 
 HTML_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
 
+# Monitor: uma pagina que mostra o que a instancia esta mostrando na tela, atualizada a
+# cada ~2 s. Serve para acompanhar um teste sem abrir o jogo. So leitura de tela
+# (ffmpeg x11grab), nao faz parte do caminho de streaming.
+MONITOR_DISPLAY = os.environ.get("MONITOR_DISPLAY", SHARED_DISPLAY)
+MONITOR_FILE = os.environ.get("MONITOR_FILE", "/mnt/windows/aomstream/monitor.jpg")
+# Recorte opcional "WxH+X+Y" para capturar so a janela do jogo; sem isso captura a tela inteira.
+MONITOR_GEOMETRY = os.environ.get("MONITOR_GEOMETRY", "")
+MONITOR_PAGE = """<!doctype html><meta charset="utf-8">
+<meta http-equiv="refresh" content="2"><title>aom monitor</title>
+<body style="background:#111;color:#ddd;font:14px/1.5 monospace;margin:16px">
+<h3>aom monitor — tela {display}</h3>
+<img src="/monitor.jpg" style="max-width:100%;border:1px solid #333">
+<p id="s">carregando…</p>
+<script>fetch('/monitor.json').then(r=>r.json()).then(d=>{
+  document.getElementById('s').textContent =
+    'jogadores conectados: ' + d.jogadores + ' | captura: ' + d.captura + ' | pads: ' + d.pads;
+}).catch(()=>{})</script></body>"""
+
+
+def capture_frame():
+    args = ["ffmpeg", "-loglevel", "error", "-f", "x11grab"]
+    if MONITOR_GEOMETRY:
+        size, _, off = MONITOR_GEOMETRY.partition("+")
+        w, h = size.split("x")
+        x, y = off.split("+")
+        args += ["-video_size", f"{w}x{h}", "-i", f"{MONITOR_DISPLAY}+{x}+{y}"]
+    else:  # sem -video_size o x11grab captura a tela inteira do display
+        args += ["-i", MONITOR_DISPLAY]
+    args += ["-frames:v", "1", "-q:v", "2", "-y", MONITOR_FILE]
+    try:
+        subprocess.run(args, timeout=8, check=False)
+    except Exception as e:
+        print(f"monitor: {e}", flush=True)
+
+
+async def monitor_loop():
+    while True:
+        capture_frame()
+        await asyncio.sleep(2)
+
 
 async def process_request(connection, request):
     q = urllib.parse.urlparse(request.path).query
@@ -1369,10 +1415,28 @@ async def process_request(connection, request):
         "t0": time.time(),
     }
     path = request.path.split("?")[0]
-    if path == "/" and request.headers.get("Upgrade", "").lower() != "websocket":
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return None
+    if path == "/":
         with open(HTML_PATH, "rb") as f:
             body = f.read()
         return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), body)
+    if path == "/monitor":
+        # .format() nao serve: a pagina tem chaves no JavaScript
+        body = MONITOR_PAGE.replace("{display}", MONITOR_DISPLAY).encode()
+        return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), body)
+    if path == "/monitor.jpg":
+        try:
+            with open(MONITOR_FILE, "rb") as f:
+                body = f.read()
+        except OSError:
+            body = b""
+        return Response(200, "OK", Headers({"Content-Type": "image/jpeg"}), body)
+    if path == "/monitor.json":
+        info = {"jogadores": len(ACTIVE), "captura": time.strftime("%H:%M:%S"),
+                "pads": len(ROOM["pads"]) if ROOM else 0}
+        return Response(200, "OK", Headers({"Content-Type": "application/json"}),
+                        json.dumps(info).encode())
     return None
 
 
@@ -1386,6 +1450,13 @@ async def main():
               ", ".join(f"{n}->{p['display']}/slot{p['slot']}" for n, p in PLAYERS.items()), flush=True)
     print(f"convites: {'on' if INVITE_KEY else 'off'}, teto {INVITE_MAX} jogadores, "
           f"spawn {'liberado' if CAN_SPAWN else 'sem permissao'} ({SPAWN})", flush=True)
+    asyncio.create_task(monitor_loop())
+    if MODE == "shared":
+        # Pads na subida, antes do emulador abrir o SDL: o SDL enumera os dispositivos
+        # pela ordem de criacao, e a mapping do PCSX2 aponta para SDL-0..7. Se a sala
+        # so nascesse na primeira conexao, os pads do servidor entrariam como SDL-8..15
+        # e o input do navegador nao chegaria ao jogo.
+        await get_room(asyncio.get_running_loop(), startup=True)
     # ping de protocolo a cada 20 s + ping JSON do cliente a cada 30 s: um proxy ou o
     # tunel derruba um WebSocket ocioso (o Cloudflare fecha em ~100 s sem trafego).
     async with websockets.serve(handler, "0.0.0.0", PORT, process_request=process_request,
