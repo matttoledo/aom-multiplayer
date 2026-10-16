@@ -32,8 +32,15 @@ import os
 import threading
 import time
 
+import fractions
+
 import av
-from aiortc.mediastreams import AUDIO_TIME_BASE, MediaStreamError, MediaStreamTrack, VIDEO_TIME_BASE
+from aiortc.mediastreams import MediaStreamError, MediaStreamTrack, VIDEO_TIME_BASE
+
+try:
+    from aiortc.mediastreams import AUDIO_TIME_BASE
+except ImportError:  # aiortc 1.15 nao expoe AUDIO_TIME_BASE; o time base do audio e 1/clock_rate
+    AUDIO_TIME_BASE = fractions.Fraction(1, 48000)
 
 WIDTH = int(os.environ.get("WIDTH", "1280"))
 HEIGHT = int(os.environ.get("HEIGHT", "720"))
@@ -128,7 +135,9 @@ class FanoutSource:
         # jogador): o mesmo lock vale aqui.
         self.decoding = threading.Lock()
         self.pipes = []
-        self.start = None
+        # Nao pode chamar "start": e o nome do metodo start() desta classe, e o atributo
+        # sombra quebrava o call (TypeError: NoneType is not callable, medido).
+        self.t0 = None
         self.frames = 0
         # O primeiro access unit da fonte e sempre IDR: um peer que entra depois
         # precisa de um keyframe para comecar.
@@ -164,9 +173,9 @@ class FanoutSource:
                 if frame is None:
                     break
                 captured = time.time()
-                if self.start is None:
-                    self.start = captured
-                    print(f"primeiro frame capturado; serverStart = {self.start}", flush=True)
+                if self.t0 is None:
+                    self.t0 = captured
+                    print(f"primeiro frame capturado; serverStart = {self.t0}", flush=True)
                 forced = self.force_keyframe
                 self.force_keyframe = False
                 data, ts = await self.loop.run_in_executor(None, self.encode, frame, forced)
@@ -177,7 +186,7 @@ class FanoutSource:
                 for pipe in list(self.pipes):
                     pipe.put(unit)
                 if self.frames % 300 == 0:
-                    print(f"fan-out: {self.frames} frames em {time.time() - self.start:.1f}s, "
+                    print(f"fan-out: {self.frames} frames em {time.time() - self.t0:.1f}s, "
                           f"{len(self.pipes)} peers", flush=True)
         except Exception as e:
             print(f"fan-out: fonte parou: {e!r}", flush=True)
