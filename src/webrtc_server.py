@@ -1371,16 +1371,27 @@ MONITOR_DISPLAY = os.environ.get("MONITOR_DISPLAY", SHARED_DISPLAY)
 MONITOR_FILE = os.environ.get("MONITOR_FILE", "/mnt/windows/aomstream/monitor.jpg")
 # Recorte opcional "WxH+X+Y" para capturar so a janela do jogo; sem isso captura a tela inteira.
 MONITOR_GEOMETRY = os.environ.get("MONITOR_GEOMETRY", "")
+# Sem isso o Cloudflare guarda o /monitor.jpg por 4 h (max-age=14400, cf-cache-status HIT)
+# e o monitor mostra o mesmo frame parado.
+NO_STORE = {"Cache-Control": "no-store"}
 MONITOR_PAGE = """<!doctype html><meta charset="utf-8">
-<meta http-equiv="refresh" content="2"><title>aom monitor</title>
+<title>aom monitor</title>
 <body style="background:#111;color:#ddd;font:14px/1.5 monospace;margin:16px">
 <h3>aom monitor — tela {display}</h3>
-<img src="/monitor.jpg" style="max-width:100%;border:1px solid #333">
+<img id="f" src="/monitor.jpg" style="max-width:100%;border:1px solid #333">
 <p id="s">carregando…</p>
-<script>fetch('/monitor.json').then(r=>r.json()).then(d=>{
-  document.getElementById('s').textContent =
-    'jogadores conectados: ' + d.jogadores + ' | captura: ' + d.captura + ' | pads: ' + d.pads;
-}).catch(()=>{})</script></body>"""
+<script>
+// a imagem e trocada no lugar (sem recarregar a pagina); o ?ts= tira qualquer cache do caminho
+function tick() {
+  document.getElementById('f').src = '/monitor.jpg?ts=' + Date.now();
+  fetch('/monitor.json', {cache: 'no-store'}).then(r => r.json()).then(d => {
+    document.getElementById('s').textContent =
+      'jogadores conectados: ' + d.jogadores + ' | captura: ' + d.captura + ' | pads: ' + d.pads;
+  }).catch(() => {});
+}
+tick();
+setInterval(tick, 2000);
+</script></body>"""
 
 
 def capture_frame():
@@ -1424,18 +1435,22 @@ async def process_request(connection, request):
     if path == "/monitor":
         # .format() nao serve: a pagina tem chaves no JavaScript
         body = MONITOR_PAGE.replace("{display}", MONITOR_DISPLAY).encode()
-        return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), body)
+        return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8", **NO_STORE}), body)
     if path == "/monitor.jpg":
         try:
             with open(MONITOR_FILE, "rb") as f:
                 body = f.read()
         except OSError:
             body = b""
-        return Response(200, "OK", Headers({"Content-Type": "image/jpeg"}), body)
+        return Response(200, "OK", Headers({"Content-Type": "image/jpeg", **NO_STORE}), body)
     if path == "/monitor.json":
-        info = {"jogadores": len(ACTIVE), "captura": time.strftime("%H:%M:%S"),
+        try:  # hora do frame no disco, nao a hora do pedido
+            captura = time.strftime("%H:%M:%S", time.localtime(os.path.getmtime(MONITOR_FILE)))
+        except OSError:
+            captura = "sem captura"
+        info = {"jogadores": len(ACTIVE), "captura": captura,
                 "pads": len(ROOM["pads"]) if ROOM else 0}
-        return Response(200, "OK", Headers({"Content-Type": "application/json"}),
+        return Response(200, "OK", Headers({"Content-Type": "application/json", **NO_STORE}),
                         json.dumps(info).encode())
     return None
 
