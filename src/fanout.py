@@ -45,6 +45,9 @@ except ImportError:  # aiortc 1.15 nao expoe AUDIO_TIME_BASE; o time base do aud
 WIDTH = int(os.environ.get("WIDTH", "1280"))
 HEIGHT = int(os.environ.get("HEIGHT", "720"))
 FPS = int(os.environ.get("FPS", "30"))
+# Canto da janela do jogo na tela, "X,Y". Sem isso o x11grab pega a partir de 0,0: no
+# PCSX2 (janela em +1+25 no :1) o stream perdia as 25 linhas de baixo do jogo.
+CAPTURE_OFFSET = os.environ.get("CAPTURE_OFFSET", "")
 SLOT_PREFIX = os.environ.get("SLOT_PREFIX", "aom_slot")
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
@@ -150,8 +153,11 @@ class FanoutSource:
             return True
         try:
             self.container = await asyncio.to_thread(
-                av.open, f"{self.display}.0", format="x11grab",
-                options={"framerate": str(FPS), "video_size": f"{WIDTH}x{HEIGHT}"})
+                av.open, f"{self.display}.0" + (f"+{CAPTURE_OFFSET}" if CAPTURE_OFFSET else ""),
+                format="x11grab",
+                options={"framerate": str(FPS), "video_size": f"{WIDTH}x{HEIGHT}",
+                         # o ponteiro do X aparecia parado no meio do jogo
+                         "draw_mouse": "0"})
         except Exception as e:
             print(f"fan-out: captura {self.display} falhou: {e}", flush=True)
             return False
@@ -159,7 +165,8 @@ class FanoutSource:
         self.gen = self.container.decode(self.stream)
         self.running = True
         self.task = asyncio.create_task(self.run())
-        print(f"fan-out: fonte na tela {self.display}, {WIDTH}x{HEIGHT}@{FPS}", flush=True)
+        print(f"fan-out: fonte na tela {self.display}+{CAPTURE_OFFSET or '0,0'}, "
+              f"{WIDTH}x{HEIGHT}@{FPS}", flush=True)
         return True
 
     def _decode(self):

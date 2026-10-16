@@ -5,6 +5,8 @@ set -e
 cd /home/matt/aomstream
 set -a; . ./.env; set +a
 export AOM_MODE=shared AOM_SHARED_DISPLAY=:1 MONITOR_DISPLAY=:1 WIDTH=640 HEIGHT=480 DISPLAY=:1
+# janela de render do PCSX2 abre em +1+25 no :1 (xwininfo)
+export CAPTURE_OFFSET=1,25
 for p in $(pgrep -x python3); do grep -q webrtc_server /proc/$p/cmdline && kill $p; done
 pkill -x pcsx2-qt || true
 for i in $(seq 1 20); do pgrep -x pcsx2-qt >/dev/null || break; sleep 0.5; done
