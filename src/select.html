@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<title>Escolher jogo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg: #0d0f12; --bar: #161a20; --line: #262c35; --text: #e6e8eb; --muted: #8b939e;
+    --accent: #d9a441; --ok: #3fb950; --warn: #d29922; --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; min-height: 100vh; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 10px; padding: 12px 16px;
+           background: var(--bar); border-bottom: 1px solid var(--line); }
+  .brand { font-weight: 700; letter-spacing: .3px; color: var(--accent); }
+  .brand span { color: var(--muted); font-weight: 500; }
+  .pill { display: inline-flex; align-items: center; gap: 8px; padding: 4px 10px;
+          border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
+  .pill.ok .dot { background: var(--ok); } .pill.bad .dot { background: var(--bad); }
+  main { padding: 20px 16px; display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--bar); border: 1px solid var(--line); border-radius: 10px; padding: 16px; }
+  .card.current { border-color: var(--accent); }
+  .card h2 { margin: 0 0 6px; font-size: 17px; }
+  .card p { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+  .tag { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 999px;
+         border: 1px solid var(--line); color: var(--muted); margin-bottom: 10px; }
+  .state { font: 12px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; color: #b9c3cf; margin-bottom: 12px; }
+  button { font: inherit; color: var(--text); background: #1f242c; border: 1px solid var(--line);
+           border-radius: 6px; padding: 6px 12px; cursor: pointer; }
+  button:hover { border-color: #3a424e; background: #252b34; }
+  button.primary { background: var(--accent); color: #1a1408; border-color: var(--accent); font-weight: 600; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  #note { padding: 0 16px 20px; color: var(--muted); font-size: 13px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">stream <span>escolher jogo</span></div>
+  <div id="pill" class="pill"><span class="dot"></span><span id="pillText">conectando…</span></div>
+</header>
+<main id="cards"></main>
+<p id="note">O jogo e da sessao inteira: quem escolhe define o jogo para todos. Com alguem dentro, o jogo nao muda ate a sessao esvaziar.</p>
+<script>
+const GAMES = [
+  { id: 'aom',  name: 'Age of Mythology: Extended Edition',
+    tag: 'multiplayer', desc: 'Cada jogador tem sua instancia; o multiplayer e do proprio jogo (LAN, portas 2299/2300).' },
+  { id: 'nfsu', name: 'Need for Speed Underground 2',
+    tag: 'um motorista, outros assistem', desc: 'Sem multiplayer LAN. Um jogador dirige, os outros veem a mesma tela e o mesmo som. Gamepad do motorista.' },
+];
+
+// O token vem no URL (?t=...), o mesmo que a pagina do player usa.
+const token = new URLSearchParams(location.search).get('t') || '';
+const cards = document.getElementById('cards');
+const pillText = document.getElementById('pillText');
+const pill = document.getElementById('pill');
+let state = { game: 'aom', players: 0, driver: 1 };
+
+function render() {
+  cards.innerHTML = '';
+  for (const g of GAMES) {
+    const cur = state.game === g.id;
+    const el = document.createElement('div');
+    el.className = 'card' + (cur ? ' current' : '');
+    const who = state.players ? `dentro: ${state.players}` : 'sessao vazia';
+    const drv = cur && g.id === 'nfsu' ? ` motorista: jogador ${state.driver}` : '';
+    el.innerHTML = `<h2>${g.name}</h2><div class="tag">${g.tag}</div><p>${g.desc}</p>` +
+                   `<div class="state">${who}${drv}</div>`;
+    const b = document.createElement('button');
+    b.className = 'primary';
+    b.textContent = cur ? 'Entrar' : 'Escolher';
+    b.disabled = !cur && state.players > 0;
+    b.onclick = () => pick(g.id);
+    el.appendChild(b);
+    cards.appendChild(el);
+  }
+}
+
+let pending = null;   // jogo que esta pagina acabou de escolher
+
+function pick(game) {
+  // Escolher com a sessao vazia: manda o jogo e entra. Entrar no jogo atual: so entra.
+  if (state.game === game) go(game);
+  else { pending = game; ws.send(JSON.stringify({ t: 'game', game })); }
+}
+
+function go(game) {
+  location.href = '/play?' + new URLSearchParams({ t: token, game });
+}
+
+let ws;
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/?t=${encodeURIComponent(token)}`);
+  ws.onopen = () => {
+    pill.classList.add('ok');
+    pillText.textContent = 'conectado';
+    ws.send(JSON.stringify({ t: 'game' }));
+  };
+  ws.onmessage = (e) => {
+    const m = JSON.parse(e.data);
+    if (m.t === 'game-ok') {
+      state = { game: m.game, players: m.players, driver: m.driver };
+      render();
+      // acabou de escolher: entra no jogo escolhido. Ou a pagina chegou pedindo um
+      // jogo (?game=...) que bate com o da sessao: entra direto.
+      const want = pending || new URLSearchParams(location.search).get('game');
+      if (want && want === state.game && !window.__entered) {
+        window.__entered = true;
+        go(state.game);
+      }
+    } else if (m.t === 'game-error') {
+      pill.classList.remove('ok');
+      pill.classList.add('bad');
+      pillText.textContent = m.msg;
+    } else if (m.t === 'error') {
+      pill.classList.remove('ok');
+      pill.classList.add('bad');
+      pillText.textContent = m.msg;
+    }
+  };
+  ws.onclose = () => {
+    pill.classList.remove('ok');
+    pill.classList.add('bad');
+    pillText.textContent = 'desconectado';
+    setTimeout(connect, 2000);
+  };
+}
+
+if (!token) {
+  pill.classList.add('bad');
+  pillText.textContent = 'link sem token';
+}
+render();
+if (token) {
+  connect();
+  // estado da sessao muda quando alguem entra: atualizar sem recarregar
+  setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ t: 'game' })); }, 5000);
+}
+</script>
+</body>
+</html>
