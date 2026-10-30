@@ -86,6 +86,20 @@ navegador  ──WebSocket (signalização)──►  webrtc_server.py
   extrair o AAC do fMP4. `play()` com som é bloqueado pelo navegador até um gesto do usuário
   (botão "ativar som").
 
+## Serviço (systemd) e logs
+
+`deploy/aom-webrtc.service` roda o `webrtc_server.py` como serviço do `matt` com `Restart=always`
+(reinicia em 2 s se cair). Instalado no asus em `/etc/systemd/system/`; o jogador 1 **não** sobe
+junto (`instance.sh 1 aom` à mão), os jogadores 2-8 sobem pelo `spawn.sh` quando conectam.
+
+- `PYTHONFAULTHANDLER=1` + `-X faulthandler`: um segfault (medido em 2026-10-30, `libnvcuvid`
+  no reconectar) deixa a pilha das threads no journal em vez de só sumir o processo.
+- `journalctl -u aom-webrtc` tem tudo, inclusive as métricas (`encode`, `fan-out`, `retransmit`).
+- `/var/log/aom/events.log` tem só os eventos (entrada, saída, spawn, convite, erro); a rotação
+  está em `deploy/aom-events.logrotate` (semanal, 4 arquivos, `copytruncate`).
+- O journald do asus fica limitado a 300 MB (`/etc/systemd/journald.conf.d/aom.conf`), porque a
+  raiz estava a 96 %.
+
 ## Diretórios
 
 | Pasta | Conteúdo |

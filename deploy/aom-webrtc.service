@@ -1,0 +1,20 @@
+[Unit]
+Description=AoM multiplayer WebRTC server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=matt
+WorkingDirectory=/home/matt/aomstream
+EnvironmentFile=/home/matt/aomstream/.env
+Environment=DISPLAY=:2 PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1 XDG_RUNTIME_DIR=/run/user/1001
+# stdout: tudo no journal (com rotacao do journald) e so os eventos, sem metricas, em
+# /var/log/aom/events.log. stderr (tracebacks e a pilha do faulthandler) vai so ao journal.
+ExecStart=/bin/bash -c 'exec .venv/bin/python3 -X faulthandler webrtc_server.py > >(tee >(grep --line-buffered -vE "^(encode|fan-out|retransmit|webrtc: |audio slot)" >> /var/log/aom/events.log))'
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+SyslogIdentifier=aom-webrtc
+
+[Install]
+WantedBy=multi-user.target
